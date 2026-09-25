@@ -3,6 +3,18 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import semver from 'semver'
 
+/**
+ * Evaluate a peer range the way the HOST does, not the way `semver` defaults.
+ * dsh-app-boot admits a plugin with
+ * `semver.satisfies(runtimeVersion, requirement, { includePrerelease: true })`
+ * (dsh-app-boot/lib/index.js), so a prerelease runtime such as `0.1.7-rc.2` —
+ * the one this port targets — satisfies the range on a real host. Without the
+ * option node-semver's same-tuple rule reports it unsatisfied, and this suite
+ * would be asserting a rule no host applies.
+ */
+const satisfies = (version: string, range: string): boolean =>
+  semver.satisfies(version, range, { includePrerelease: true })
+
 // The peer contract spans FIVE seam packages the plugin VALUE-imports at
 // runtime (not type-only, so they must resolve to the host's copy, not a
 // stale nested copy): dsh-compaction, dsh-session, dsh-llm, dsh-tools and
@@ -23,17 +35,21 @@ import semver from 'semver'
 // and forbids `sourceEventSeqs` on assistant replaces; both are pinned by the
 // typecheck against the 0.1.5-rc.1 devDeps.
 //
-// The explicit `>=0.1.5-alpha.1 <0.1.6-0` form pins EXACTLY the 0.1.5 line
-// (every 0.1.5 prerelease plus the final 0.1.5) and nothing beyond it: node-semver
-// sorts `0.1.6-0` before any `0.1.6-x` prerelease (numeric ids precede
-// alphanumeric ones), so the next line's alphas/rCs are rejected until someone
-// verifies them deliberately. A caret (`^0.1.5-alpha.1`) would silently admit
-// 0.1.6+ — never allowed here (house rule: no unverified line).
+// The range is now `>=0.1.5-alpha.1 <0.1.8-0`: the 0.1.7 port widened the
+// ceiling from `<0.1.6-0` after verifying every seam on 0.1.7-rc.2 — the
+// settings provider/namespace seam was REMOVED there (src/settings.ts now
+// guards at runtime and falls back to the inline config), and message sources
+// moved to producer-owned kinds (src/messages.ts). Per the original house rule
+// the ceiling moved only because the line was verified deliberately; the `-0`
+// suffix keeps it exclusive of every 0.1.8 prerelease, so 0.1.8 and 0.2.x stay
+// unadmitted. A caret floor would still silently admit them — never used.
 //
 // The same-tuple prerelease rule still applies underneath: a candidate with a
 // prerelease tag only satisfies a range when some comparator shares its
 // [major, minor, patch] tuple — `0.1.5-alpha.1`/`rc.x` all share tuple 0.1.5,
-// which is why one clause covers the whole line.
+// which is why one clause covers the whole 0.1.5 line. The host's
+// `includePrerelease` option (mirrored by `satisfies` above) is what lets the
+// 0.1.7 prereleases past that rule.
 //
 // Versions below come from `npm view @deepseek-ai/dsh-session versions` — the
 // published line matches dsh-compaction / dsh-llm / dsh-tools exactly.
@@ -67,7 +83,7 @@ for (const peerName of seamPeers) {
 		// build from issue #136 (0.1.5-alpha.2).
 		for (const v of ['0.1.5-alpha.1', '0.1.5-alpha.2', '0.1.5-rc.1']) {
 			assert.equal(
-				semver.satisfies(v, peerRange),
+				satisfies(v, peerRange),
 				true,
 				`${v} must satisfy ${peerRange} (same replace-op dialect as 0.1.5-alpha.1)`,
 			)
@@ -75,10 +91,10 @@ for (const peerName of seamPeers) {
 		// Future same-tuple prereleases keep installing: publishing newer rCs on
 		// the 0.1.5 line never breaks installs.
 		for (const v of ['0.1.5-rc.9', '0.1.5-rc.99']) {
-			assert.equal(semver.satisfies(v, peerRange), true, `${v} must satisfy ${peerRange} (same-line rc)`)
+			assert.equal(satisfies(v, peerRange), true, `${v} must satisfy ${peerRange} (same-line rc)`)
 		}
 		// A final 0.1.5 (no prerelease) is a normal version and stays in range.
-		assert.equal(semver.satisfies('0.1.5', peerRange), true)
+		assert.equal(satisfies('0.1.5', peerRange), true)
 	})
 
 	test(`${peerName}: peer range keeps rejecting older and next-line versions`, () => {
@@ -87,12 +103,19 @@ for (const peerName of seamPeers) {
 		// reject the startSeq/endSeq dialect at runtime (issue #136), so they are
 		// intentionally out of contract.
 		for (const v of ['0.1.0-rc.6', '0.1.1-rc.2', '0.1.2-alpha.4', '0.1.2-rc.1', '0.1.3-alpha.2']) {
-			assert.equal(semver.satisfies(v, peerRange), false, `${v} must NOT satisfy ${peerRange}`)
+			assert.equal(satisfies(v, peerRange), false, `${v} must NOT satisfy ${peerRange}`)
 		}
-		// Next lines: 0.1.6 (any prerelease or final) and 0.2.x are deliberate,
-		// later decisions — never silently allowed.
-		for (const v of ['0.1.6-alpha.1', '0.1.6-rc.1', '0.1.6', '0.2.0-rc.1', '0.2.0']) {
-			assert.equal(semver.satisfies(v, peerRange), false, `${v} must NOT satisfy ${peerRange}`)
+		// Next lines: 0.1.6 and 0.1.7 are now IN range. The 0.1.7 port widened the
+		// ceiling to `<0.1.8-0` as a deliberate decision, not a blanket relax: every
+		// seam this package reaches was verified on 0.1.7-rc.2 (the settings
+		// provider/namespace seam was removed there → runtime guard; message
+		// sources moved to producer-owned kinds → see src/messages.ts). 0.1.8 and
+		// 0.2.x stay deliberate later decisions and must never be allowed silently.
+		for (const v of ['0.1.6-alpha.1', '0.1.6-rc.1', '0.1.6', '0.1.7-alpha.1', '0.1.7-rc.2', '0.1.7']) {
+			assert.equal(satisfies(v, peerRange), true, `${v} must satisfy ${peerRange} (ported 0.1.7 line)`)
+		}
+		for (const v of ['0.1.8-alpha.1', '0.1.8', '0.2.0-rc.1', '0.2.0']) {
+			assert.equal(satisfies(v, peerRange), false, `${v} must NOT satisfy ${peerRange}`)
 		}
 	})
 }

@@ -22,7 +22,7 @@ import {
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { AcpStateStore } from './state.ts'
-import { allLogMessages, eventsToCoreMessages, isCheckpointNode, surfaceEventsOf } from './messages.ts'
+import { allLogMessages, engineSource, eventsToCoreMessages, isCheckpointNode, surfaceEventsOf } from './messages.ts'
 import {
   buildCompressibleSeqRanges,
   findOpenTurn,
@@ -297,7 +297,7 @@ export function buildNudge(
   const text = buildNudgeText(nudge, emergency, session, kernelRangeViewOf(nudge, turn.state), env.prompts)
   const message = createUserMessage({
     content: [{ type: 'text', text }],
-    source: { kind: 'plugin', plugin: 'acp-nudge' },
+    source: engineSource('acp-nudge', 'nudge'),
   })
   return { message, emergency }
 }

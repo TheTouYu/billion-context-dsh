@@ -3545,7 +3545,7 @@ function extractEventText(event) {
 function isCheckpointNode(event) {
   if (event.type !== "user/message") return false;
   const source = event.data.source;
-  return source?.plugin === "compact";
+  return source?.kind === "compact-checkpoint" || source?.plugin === "compact";
 }
 var METADATA_PLUGINS = /* @__PURE__ */ new Set([
   "acp-nudge",
@@ -3553,10 +3553,22 @@ var METADATA_PLUGINS = /* @__PURE__ */ new Set([
   "billion-context-dsh"
   // compress-pair replacement stub (src/region.ts)
 ]);
+var METADATA_KINDS = /* @__PURE__ */ new Set([
+  "acp-nudge",
+  "billion-context-dsh"
+]);
+function engineSource(kind, form) {
+  return { kind, form };
+}
 var REAL_CONTENT_PLUGINS = /* @__PURE__ */ new Set([
   "@deepseek-ai/dsh-system-prompt",
   "user-approval",
   "tools-ptc"
+]);
+var REAL_CONTENT_KINDS = /* @__PURE__ */ new Set([
+  "runtime-context",
+  "ptc-mode",
+  "user-approval"
 ]);
 var HOST_INSTRUCTION_KINDS = /* @__PURE__ */ new Set([
   "agent-instructions",
@@ -3577,6 +3589,8 @@ function classifySurfaceEvent(event) {
   if (!source) return "real";
   const kind = source.kind;
   if (kind === "user") return "real";
+  if (kind !== void 0 && METADATA_KINDS.has(kind)) return "metadata";
+  if (kind !== void 0 && REAL_CONTENT_KINDS.has(kind)) return "real";
   if (kind === "plugin") {
     if (source.plugin !== void 0 && METADATA_PLUGINS.has(source.plugin)) return "metadata";
     if (source.plugin !== void 0 && REAL_CONTENT_PLUGINS.has(source.plugin)) return "real";
@@ -3590,6 +3604,7 @@ function isRealUserTurn(event) {
   if (classifySurfaceEvent(event) !== "real") return false;
   const source = event.data.source;
   if (source?.plugin !== void 0 && REAL_CONTENT_PLUGINS.has(source.plugin)) return false;
+  if (source?.kind !== void 0 && REAL_CONTENT_KINDS.has(source.kind)) return false;
   return source?.kind !== "subagent-report" && source?.kind !== "subagent-settled";
 }
 
@@ -4035,7 +4050,7 @@ function hideSurfaceSeqs(session, seqs, text, priceEvent = hostPriceEvent) {
   const body = text !== void 0 && text.trim().length > 0 ? text : PRUNE_NOTE;
   session.append("user/message", createUserMessage({
     content: [{ type: "text", text: body }],
-    source: { kind: "plugin", plugin: "billion-context-dsh" }
+    source: engineSource("billion-context-dsh", "prune-tombstone")
   }), {
     surfaceOp: { op: "replace", startSeq: start, endSeq: end },
     sourceEventSeqs: [...seqs]
@@ -4762,7 +4777,7 @@ function buildNudge(agent, env, lastNudgeTurn, emergencyNudges, onEmergencyCapHi
   const text = buildNudgeText(nudge, emergency, session, kernelRangeViewOf(nudge, turn.state), env.prompts);
   const message = createUserMessage2({
     content: [{ type: "text", text }],
-    source: { kind: "plugin", plugin: "acp-nudge" }
+    source: engineSource("acp-nudge", "nudge")
   });
   return { message, emergency };
 }

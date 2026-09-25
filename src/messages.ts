@@ -13,6 +13,7 @@
 
 import type { CoreMessage } from 'acp-kernel'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import type { MessageSource } from '@deepseek-ai/dsh-llm'
 import { eventAtOf, sessionEventsOf } from './session-events.ts'
 
 /**
@@ -240,8 +241,12 @@ export function extractEventText(event: SessionEvent): string {
  */
 export function isCheckpointNode(event: SessionEvent): boolean {
   if (event.type !== 'user/message') return false
-  const source = (event.data as { source?: { plugin?: string } }).source
-  return source?.plugin === 'compact'
+  const source = (event.data as { source?: { kind?: string; plugin?: string } }).source
+  // 0.1.7 stamps `{ kind: 'compact-checkpoint' }`; 0.1.5 stamped
+  // `{ kind: 'plugin', plugin: 'compact' }`. Both are read: sessions committed
+  // before the upgrade still carry the legacy row, and a checkpoint that stops
+  // classifying as one becomes foldable — distillation is an explicit act.
+  return source?.kind === 'compact-checkpoint' || source?.plugin === 'compact'
 }
 
 /**
@@ -269,11 +274,45 @@ export function isCheckpointNode(event: SessionEvent): boolean {
  */
 export type SurfaceEventClass = 'real' | 'metadata' | 'checkpoint' | 'instruction'
 
-/** Plugin names the engine itself authors — safe to fold into real segments. */
+/**
+ * Plugin names the engine itself authors — safe to fold into real segments.
+ * LEGACY shape only: 0.1.5 wrote `{ kind: 'plugin', plugin }`, which 0.1.7's
+ * `assertV4SourceRowAdmission` now refuses, so this set exists to READ rows
+ * already committed and never to author new ones. New writes carry the
+ * producer-owned kind instead (see {@link engineSource}).
+ */
 export const METADATA_PLUGINS: ReadonlySet<string> = new Set([
   'acp-nudge', // nudge echo (src/nudge.ts)
   'billion-context-dsh', // compress-pair replacement stub (src/region.ts)
 ])
+
+/**
+ * Producer-owned kinds for the same engine-authored rows, keyed the way 0.1.7
+ * records them. `MessageSource.kind` answers *who produced this*, and the
+ * format refuses the generic `{ kind: 'plugin', plugin }` wrapper outright
+ * (`format v4 message requires a producer-owned source kind`). Kept in step
+ * with {@link METADATA_PLUGINS} by {@link engineSource}, which is the only
+ * writer.
+ */
+export const METADATA_KINDS: ReadonlySet<string> = new Set([
+  'acp-nudge',
+  'billion-context-dsh',
+])
+
+/**
+ * Build the `source` for one engine-authored injected row. The single writer
+ * for {@link METADATA_KINDS}, so a kind can never be authored that the
+ * classifier below does not recognise as engine metadata.
+ *
+ * The assertion covers 0.1.5's `MessageSourceMap`, which has no member for a
+ * plugin-owned kind. Both versions type `MessageSource` as
+ * `MessageSourceMap[keyof MessageSourceMap]` — an OPEN interface — and both
+ * pass `user/message` rows through their runtime validation, so the value is
+ * legal at run time in either version; only the pre-0.1.7 type needs the cast.
+ */
+export function engineSource(kind: 'acp-nudge' | 'billion-context-dsh', form: string): MessageSource {
+  return { kind, form } as unknown as MessageSource
+}
 
 /**
  * Host plugins whose rows are real CONTENT, not policy: folding them reclaims
@@ -292,6 +331,23 @@ const REAL_CONTENT_PLUGINS: ReadonlySet<string> = new Set([
   '@deepseek-ai/dsh-system-prompt',
   'user-approval',
   'tools-ptc',
+])
+
+/**
+ * The same host content rows under their 0.1.7 producer-owned kinds. The
+ * upgrade renamed every one of them, so keying only on the legacy names would
+ * misfile each as an unknown policy row — snapshot rows would stop folding and
+ * the protection window would refuse them for the wrong reason.
+ * Names come from the format's own migration tables (`RENAMED_PRODUCERS` for
+ * the three that changed, `RELEASED_SAME_NAME_PRODUCERS` for the rest).
+ *  - 'runtime-context' — was '@deepseek-ai/dsh-system-prompt'
+ *  - 'ptc-mode' — was 'tools-ptc' / 'tools-code-mode'
+ *  - 'user-approval' — unchanged name, new kind
+ */
+const REAL_CONTENT_KINDS: ReadonlySet<string> = new Set([
+  'runtime-context',
+  'ptc-mode',
+  'user-approval',
 ])
 
 /** Known host policy kinds that must never be folded (safe-listing beyond `plugin`). */
@@ -323,6 +379,11 @@ export function classifySurfaceEvent(event: SessionEvent): SurfaceEventClass {
   if (!source) return 'real' // user turn written without a source: genuine content
   const kind = source.kind
   if (kind === 'user') return 'real' // real user turn (host stamps {kind:'user'})
+  // Producer-owned kinds first: this is what 0.1.7 writes, and it is the only
+  // shape that reaches a new session's log at all.
+  if (kind !== undefined && METADATA_KINDS.has(kind)) return 'metadata'
+  if (kind !== undefined && REAL_CONTENT_KINDS.has(kind)) return 'real'
+  // Legacy `kind:'plugin'` — read-only path for rows committed by 0.1.5.
   if (kind === 'plugin') {
     if (source.plugin !== undefined && METADATA_PLUGINS.has(source.plugin)) return 'metadata'
     if (source.plugin !== undefined && REAL_CONTENT_PLUGINS.has(source.plugin)) return 'real'
@@ -355,5 +416,6 @@ export function isRealUserTurn(event: SessionEvent): boolean {
   // approval notice, deferred tool context): foldable, but they must never win
   // the protection window — that is exactly the bug class issue #71 fixes.
   if (source?.plugin !== undefined && REAL_CONTENT_PLUGINS.has(source.plugin)) return false
+  if (source?.kind !== undefined && REAL_CONTENT_KINDS.has(source.kind)) return false
   return source?.kind !== 'subagent-report' && source?.kind !== 'subagent-settled'
 }

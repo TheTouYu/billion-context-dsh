@@ -30,7 +30,7 @@ import assert from 'node:assert/strict'
 import { createCore, type CompressionCore } from 'acp-kernel'
 import { Session } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { classifySurfaceEvent, isRealUserTurn } from '../src/messages.ts'
+import { classifySurfaceEvent, engineSource, isRealUserTurn } from '../src/messages.ts'
 import { acpCommand } from '../src/commands.ts'
 import { buildCompressibleSeqRanges, guardedSurfaceSeqsOf, newestInstructionSeqsOf, runCompactionTransaction, shadowedSeqsOf } from '../src/region.ts'
 import { guardedRowsInSpan, makeTools, protectedRowRejectionNote, type ToolEnvironment } from '../src/tools.ts'
@@ -101,9 +101,22 @@ test('PR1: classifySurfaceEvent buckets host policy rows; real content stays rea
   // The engine's own metadata rows stay metadata (foldable, like main).
   assert.equal(ev({ kind: 'plugin', plugin: 'acp-nudge' }), 'metadata')
   assert.equal(ev({ kind: 'plugin', plugin: 'billion-context-dsh' }), 'metadata')
+  // …and the same rows under the 0.1.7 producer-owned shape the engine now
+  // writes. The format refuses the `kind:'plugin'` wrapper on new writes
+  // (`format v4 message requires a producer-owned source kind`), so this is the
+  // only shape a new session ever holds; the legacy rows above keep reading.
+  assert.equal(ev(engineSource('acp-nudge', 'nudge')), 'metadata', 'producer-owned nudge echo')
+  assert.equal(ev(engineSource('billion-context-dsh', 'prune-tombstone')), 'metadata', 'producer-owned prune tombstone')
 
   // Compaction checkpoints.
   assert.equal(ev({ kind: 'plugin', plugin: 'compact' }), 'checkpoint')
+  assert.equal(ev({ kind: 'compact-checkpoint', compactionId: 'c1' }), 'checkpoint', '0.1.7 checkpoint shape')
+
+  // Host CONTENT rows under their 0.1.7 producer-owned kinds: folding them
+  // reclaims tokens and provokes nothing, exactly like the legacy names above.
+  assert.equal(ev({ kind: 'runtime-context', form: 'snapshot', sections: [] }), 'real', 'was @deepseek-ai/dsh-system-prompt')
+  assert.equal(ev({ kind: 'ptc-mode' }), 'real', 'was tools-ptc')
+  assert.equal(ev({ kind: 'user-approval' }), 'real')
 
   // Instruction rows: AGENTS.md in both audited host shapes, skill catalogs,
   // and unknown plugin rows (a future host injection must never silently
@@ -118,8 +131,11 @@ test('PR1: classifySurfaceEvent buckets host policy rows; real content stays rea
   // rows and relays never do (the old tail-scan bug protected those instead).
   assert.equal(isRealUserTurn({ type: 'user/message', seq: 1, data: { source: { kind: 'user' } } } as never), true)
   assert.equal(isRealUserTurn({ type: 'user/message', seq: 2, data: { source: instructionSource('.\u0000AGENTS.md', 'v1') } } as never), false)
-  assert.equal(isRealUserTurn({ type: 'user/message', seq: 3, data: { source: { kind: 'subagent-report' } } } as never), false)
-  assert.equal(isRealUserTurn({ type: 'tool/result', seq: 4, data: {} } as never), false)
+  assert.equal(isRealUserTurn({ type: 'user/message', seq: 4, data: { source: { kind: 'subagent-report' } } } as never), false)
+  assert.equal(isRealUserTurn({ type: 'tool/result', seq: 5, data: {} } as never), false)
+  // 0.1.7 shapes of the same two exclusions.
+  assert.equal(isRealUserTurn({ type: 'user/message', seq: 6, data: { source: { kind: 'runtime-context', form: 'snapshot', sections: [] } } } as never), false, 'host snapshot is not the user speaking')
+  assert.equal(isRealUserTurn({ type: 'user/message', seq: 7, data: { source: engineSource('acp-nudge', 'nudge') } } as never), false, 'nudge echo is not the user speaking')
 })
 
 test('PR1: the range table splits at instruction rows — no offered range contains one', () => {

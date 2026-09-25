@@ -12,6 +12,7 @@
  */
 import type { CoreMessage } from 'acp-kernel';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
+import type { MessageSource } from '@deepseek-ai/dsh-llm';
 /**
  * Extract plain text from a DSH content block array or string.
  *
@@ -106,8 +107,35 @@ export declare function isCheckpointNode(event: SessionEvent): boolean;
  *   compressible content.
  */
 export type SurfaceEventClass = 'real' | 'metadata' | 'checkpoint' | 'instruction';
-/** Plugin names the engine itself authors — safe to fold into real segments. */
+/**
+ * Plugin names the engine itself authors — safe to fold into real segments.
+ * LEGACY shape only: 0.1.5 wrote `{ kind: 'plugin', plugin }`, which 0.1.7's
+ * `assertV4SourceRowAdmission` now refuses, so this set exists to READ rows
+ * already committed and never to author new ones. New writes carry the
+ * producer-owned kind instead (see {@link engineSource}).
+ */
 export declare const METADATA_PLUGINS: ReadonlySet<string>;
+/**
+ * Producer-owned kinds for the same engine-authored rows, keyed the way 0.1.7
+ * records them. `MessageSource.kind` answers *who produced this*, and the
+ * format refuses the generic `{ kind: 'plugin', plugin }` wrapper outright
+ * (`format v4 message requires a producer-owned source kind`). Kept in step
+ * with {@link METADATA_PLUGINS} by {@link engineSource}, which is the only
+ * writer.
+ */
+export declare const METADATA_KINDS: ReadonlySet<string>;
+/**
+ * Build the `source` for one engine-authored injected row. The single writer
+ * for {@link METADATA_KINDS}, so a kind can never be authored that the
+ * classifier below does not recognise as engine metadata.
+ *
+ * The assertion covers 0.1.5's `MessageSourceMap`, which has no member for a
+ * plugin-owned kind. Both versions type `MessageSource` as
+ * `MessageSourceMap[keyof MessageSourceMap]` — an OPEN interface — and both
+ * pass `user/message` rows through their runtime validation, so the value is
+ * legal at run time in either version; only the pre-0.1.7 type needs the cast.
+ */
+export declare function engineSource(kind: 'acp-nudge' | 'billion-context-dsh', form: string): MessageSource;
 /**
  * True for AGENTS.md instruction rows in BOTH host shapes: the hook shape
  * (`kind:'agent-instructions'`, form 'instructions') and the baseline shape
