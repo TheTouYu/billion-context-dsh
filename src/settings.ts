@@ -19,7 +19,23 @@
  */
 
 import z from '@deepseek-ai/schemastery'
-import type { SettingsDescriptor, SettingsProvider } from '@deepseek-ai/dsh-settings'
+import type { SettingsDescriptor } from '@deepseek-ai/dsh-settings'
+
+/**
+ * The settings-service surface this plugin consumes — declared structurally so one
+ * source compiles against both lines. 0.1.5 names the abstract service class
+ * `SettingsProvider`; 0.1.7 removed that class and renamed the concrete service
+ * `SettingsForms` (and `Context.settings` with it). `describe` / `update` /
+ * `replace` keep the same shapes on both, so the consumer only needs those.
+ */
+export interface SettingsService {
+  /** Namespace descriptors; each carries its namespace under `ns`. */
+  describe(): readonly SettingsDescriptor[]
+  /** Merge a patch into the namespace's user section. */
+  update(ns: string, patch: object): Promise<void>
+  /** Replace the namespace's whole user section. */
+  replace(ns: string, section: object): Promise<void>
+}
 
 /**
  * The host settings namespace — same id as the bundle/composition row, so "the
@@ -213,7 +229,7 @@ export interface SettingsCommandSurface {
   replaceSection(section: Record<string, unknown>): Promise<void>
 }
 
-function requireService(getService: () => SettingsProvider | undefined): SettingsProvider {
+function requireService(getService: () => SettingsService | undefined): SettingsService {
   const service = getService()
   if (service === undefined) {
     throw new Error('runtime settings are not available in this process')
@@ -228,7 +244,7 @@ function requireService(getService: () => SettingsProvider | undefined): Setting
  * (headless/plain compositions have no settings provider).
  */
 export function makeSettingsCommandSurface(
-  getService: () => SettingsProvider | undefined,
+  getService: () => SettingsService | undefined,
   getSnapshot: () => AcpSettings,
 ): SettingsCommandSurface {
   return {

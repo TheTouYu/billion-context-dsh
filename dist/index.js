@@ -6019,6 +6019,12 @@ var AcpCompactionEngine = class extends CompactionEngine {
     this.settingsCommand = makeSettingsCommandSurface(() => this.settingsService, () => current);
     if (this.config.settingsEnabled !== false) {
       ctx.inject(["settings"], (settingsCtx) => {
+        if (typeof settingsCtx.settings.installSection !== "function") {
+          this.settingsService = settingsCtx.settings;
+          return () => {
+            this.settingsService = void 0;
+          };
+        }
         settingsCtx.settings.installSection(ctx, ACP_SETTINGS_NAMESPACE, AcpSettingsSchema, compositionEntry, {
           // The seam's source type follows the entry it registered, so `source`
           // is a partial view of the settings; re-resolve it into a

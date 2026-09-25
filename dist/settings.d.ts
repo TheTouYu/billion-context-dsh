@@ -18,7 +18,22 @@
  * @module billion-context-dsh/settings
  */
 import z from '@deepseek-ai/schemastery';
-import type { SettingsDescriptor, SettingsProvider } from '@deepseek-ai/dsh-settings';
+import type { SettingsDescriptor } from '@deepseek-ai/dsh-settings';
+/**
+ * The settings-service surface this plugin consumes — declared structurally so one
+ * source compiles against both lines. 0.1.5 names the abstract service class
+ * `SettingsProvider`; 0.1.7 removed that class and renamed the concrete service
+ * `SettingsForms` (and `Context.settings` with it). `describe` / `update` /
+ * `replace` keep the same shapes on both, so the consumer only needs those.
+ */
+export interface SettingsService {
+    /** Namespace descriptors; each carries its namespace under `ns`. */
+    describe(): readonly SettingsDescriptor[];
+    /** Merge a patch into the namespace's user section. */
+    update(ns: string, patch: object): Promise<void>;
+    /** Replace the namespace's whole user section. */
+    replace(ns: string, section: object): Promise<void>;
+}
 /**
  * The host settings namespace — same id as the bundle/composition row, so "the
  * settings.yaml section" and "the cordis.patch.yml row" are one mental object.
@@ -154,4 +169,4 @@ export interface SettingsCommandSurface {
  * so the reference may legitimately be undefined for the whole process life
  * (headless/plain compositions have no settings provider).
  */
-export declare function makeSettingsCommandSurface(getService: () => SettingsProvider | undefined, getSnapshot: () => AcpSettings): SettingsCommandSurface;
+export declare function makeSettingsCommandSurface(getService: () => SettingsService | undefined, getSnapshot: () => AcpSettings): SettingsCommandSurface;

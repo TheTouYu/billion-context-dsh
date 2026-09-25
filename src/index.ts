@@ -37,7 +37,7 @@ import {
 } from '@deepseek-ai/dsh-compaction'
 import { createCore, setDocCacheCap, type CompressionCore } from 'acp-kernel'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
+import type { SettingsService } from './settings.ts'
 import { DEFAULT_SESSION_CACHE_LIMIT, LruMap } from './lru.ts'
 import { AcpStateStore } from './state.ts'
 import { makeTools, type ToolEnvironment } from './tools.ts'
@@ -319,7 +319,7 @@ export class AcpCompactionEngine extends CompactionEngine {
   /** Live settings snapshot thunk (composition → user settings layer); swapped when the settings provider attaches (SettingsProvider.installSection). */
   private readSettingsSource: () => AcpSettings = () => resolveAcpSettings({})
   /** The settings service, captured lazily for /acp config (undefined in provider-less processes). */
-  private settingsService: SettingsProvider | undefined
+  private settingsService: SettingsService | undefined
   /** /acp config read/write surface. */
   readonly settingsCommand: SettingsCommandSurface
   /** Per route the adapter's per-request output cap (the output reservation); null = undisclosed. */
@@ -393,6 +393,17 @@ export class AcpCompactionEngine extends CompactionEngine {
       // keep reading the last published value and later settings.yaml edits
       // would silently stop applying.
       ctx.inject(['settings'], (settingsCtx) => {
+        // 0.1.7 removed the namespace seam: the service is `SettingsForms` there and has
+        // no `installSection`, because a plugin's own Config *is* its settings. The row's
+        // config already supplies every value — the same source this engine reads whenever
+        // no provider is attached — so skip registration and keep the live service for
+        // `/acp config`. Guarded at runtime so one source deploys on both lines.
+        if (typeof (settingsCtx.settings as unknown as { installSection?: unknown }).installSection !== 'function') {
+          this.settingsService = settingsCtx.settings
+          return () => {
+            this.settingsService = undefined
+          }
+        }
         settingsCtx.settings.installSection(ctx, ACP_SETTINGS_NAMESPACE, AcpSettingsSchema, compositionEntry, {
           // The seam's source type follows the entry it registered, so `source`
           // is a partial view of the settings; re-resolve it into a
