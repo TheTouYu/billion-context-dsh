@@ -185,3 +185,19 @@ compress({ startSeq: 64757, endSeq: 265056, ... })
 > **dsh-session 0.1.5 协议漂移与 peer 下限（issue #136，非绕行——协议决策记录）**——replace surfaceOp 字段在 0.1.5 线改名 `{ op, start, end }` → `{ op, startSeq, endSeq }`，且校验严格为**恰好三键**（≤0.1.3-alpha.2 收旧名、≥0.1.5-alpha.1 收新名，逐版本从已发布 tarball 核实；四键形态两边都拒）→ 双方言共发不可能，引擎单一方言输出 + peer 下限 `>=0.1.5-alpha.1 <0.1.6-0`（显式区间，caret 会悄悄放进未验证的 0.1.6+ 线）。同线两个连带破坏一并处理：① assistant/message 内嵌 provider stream、**禁止携带 `sourceEventSeqs`**（运行时抛错）→ 隐形剪枝节点不复存在，`hideSurfaceSeqs` 改写可见 `PRUNE_NOTE` user 消息，范围表末位 user 保护扫描经 `isPruneTombstone` 跳过占位节点；② 宿主系统提示成为 surface node 0（`system/message`）且受保护（非 system 替换覆盖它即抛 "node 0 holds the system prompt"）→ `isSystemNode` 将其排除出可压缩表与 stale-range 恢复。回归钉：`tests/surfaceop-dialect.test.ts`（真实 0.1.5 会话 E2E：事务成功 + 恰好三键 shape 断言 + 孤儿剥离新方言 + node-0 保护）、`tests/peer-range.test.ts`（整线接受 / 其余版本线全部拒绝）。
 
 > **nudge 上下文 breakdown 口径：全日志 vs 活跃 surface（AGENTS.md rule 2）**——`buildNudge` 为支持 T2/T3 蒸馏锚点，必须把**整个日志**（`allLogMessages`，含已被压缩进 block 的历史消息）喂给 `kernel.processTurn`；kernel 的 `computeContextBreakdown` 对这份消息数组分类加总，于是 nudge 展示带上**历史累积**口径——实测 nudge 报 `85.2K tool`，而 acp_status 报真实活跃 `8.5K tool`，相差约 10 倍。`acp_status` 用 `buildStatusReport` 喂**活跃 surface**（排除 `source.plugin==='compact'` 的 checkpoint 摘要节点——`/acp` status 的 `isCheckpointEvent`），所以它反映当前真实上下文。修复：`src/nudge.ts` 导出 `computeSurfaceBreakdown(state, messages, total, growth)`——分类复刻 kernel（tool-call/tool-result→tool、role system→system、含```→code、否则→text），但 **summaries 直接取 active blocks 的 `block.summary`**（kernel 源码靠消息文本 `[Compressed conversation section]` 前缀识别摘要，而 DSH checkpoint 节点从不带此前缀，故须读 block 而非消息文本）；`buildNudge` 用活跃 surface（排除 checkpoint 节点）调用它覆盖 `nudge.contextBreakdown`。两条渲染路径（kernel `renderNudgeText` + 模板 `renderNudgeFromTemplates`）都读 `nudge.contextBreakdown`，覆盖一次即统一。该字段纯展示、不参与 `shouldInject` 决策，覆盖安全。回归测试 tests/nudge.test.ts（活跃 surface tool < 全日志 tool + block summaries>0；无块形状校验）。测试易踩坑：`compress` 工具的 `resolveSurfaceRange` pass-2 会把相邻 tool 对一并扩展吃掉（`adjusted from 2..3 to balanced edges` 扩到 1..4），若测试要保留 surface tool，须用 `runCompactionTransaction` 直接精确压范围而非走 compress 工具。
+
+---
+
+## 2026-09-29 · ACP 深度功能验证（HANDOFF 待办 ③）——真实会话五件套全绿
+
+**环境**：DSH web GUI（127.0.0.1:3080，systemd 用户服务 dsh-web），dsh 0.1.7-rc.2，本插件分支 `deployed-dsh-0.1.7`（f3f8f87），acp-kernel pin 0.0.63。验证载体 = 验证会话自身（river-acp 组合预设运行中：memo_* 工具 + 被动注入 + acp_* 全在）。此前 §二 的「compress/decompress/search_context 未实测」自此补齐。
+
+| # | 验证项 | 结果 |
+|---|---|---|
+| 1 | `acp_status` 三视图（总览 / `scope:"uncompressed"` 逐消息 / `scope:"compressed"` 逐块） | ✅ CONTEXT BREAKDOWN（tool/text/summaries 占比）+ COMPRESSED BLOCKS（bN/tier/前后尺寸/msg 数/age/topic）+ Nudge 行（growth 对 floor）+ Surface 行；逐消息视图 mN 引用可直接喂 compress |
+| 2 | 宿主自动压缩（增长锚，非模型调用） | ✅ 4 次事件共 5 块：8957438b（5 msgs ~2829 tok）→ d6ad55e4+0616ed53 批量（11+7 msgs ~9197 tok）→ f50ad20f（6 msgs ~3734 tok）；边界自动平衡（"adjusted from 22..38 to balanced edges" 类 4 次）；保护区排除生效（"Excluded 2 protected message(s) m00043, m00044"——memo_write call/result 对在 recent zone 被保护） |
+| 3 | `search_context` 穿透检索 | ✅ 块级 score 1.00 + 块内逐条原文片段（seq 41/43/48/50，score 0.04–0.17）——检索穿透摘要直达块内被遮蔽原文 |
+| 4 | `decompress` 可恢复性 | ✅ block 8957438b 5/5 条原文完整逐字恢复（看板 README、修复串 git 时间线、上游追踪表）——reconstructability 原则实测成立 |
+| 5 | `compress` 模型主动调用（含拒绝路径） | ✅ 拒绝路径×2 实测：①范围无 tool-pairing-balanced 余量 → `no tool-pairing-balanced live remainder around seq 111..115 — narrow the range or consult acp_status`（明确报错不静默、不损坏）；②内容 < 5000 字符下限 → `Total compressible content too small (1886 chars, min 5000)`。成功路径见下方后记 |
+
+**观测**：①压缩后 nudge 从 ACTIVE（growth ≥ floor 22500）回 idle（growth 94）——增长锚触发即基线清零，符合设计；②出现一个 `514→652` 块（摘要大于原文）：该块吸收了含长摘要文本的近期消息，账本如实记两侧尺寸，非缺陷；③本轮验证全程无需重启服务或重载插件。
