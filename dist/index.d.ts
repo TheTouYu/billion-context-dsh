@@ -33,7 +33,7 @@ import { AcpStateStore } from './state.ts';
 import { type ToolEnvironment } from './tools.ts';
 import { type AcpPrompts, type ResolvedPrompts } from './prompts.ts';
 import { type AcpWindow } from './window.ts';
-import { type SettingsCommandSurface } from './settings.ts';
+import { type AcpSettingsInputs, type SettingsCommandSurface, type SettingsKey } from './settings.ts';
 import { type PresetName } from './presets.ts';
 export { AcpStateStore } from './state.ts';
 export { kernelConfigFor, type KernelConfigInput } from './config.ts';
@@ -46,7 +46,7 @@ export { buildNudge, resolveTokenCount, EMERGENCY_NUDGE_MAX_PER_TURN, type Nudge
 export { DEFAULT_CONTEXT_WINDOW, detectContextWindow, projectedContextWindow, windowSourceLabel, type AcpWindow, } from './window.ts';
 export { AlreadyCompressedRangeError, rebuildBlockLedger, resolveSurfaceRange, runCompactionTransaction, shadowedSeqsOf, findOpenTurn, assertNoActiveCompaction, blockRegistry, blockRefForSummarySeq, compactionIdsOfKernelBlocks, summarySeqOfKernelBlock, expandShadowedSeqs, hideCompressToolPair, stripOrphanedSurfaceToolMessages, type AcpBlockLedgerEntry, type CompactionTransactionInput, type ResolvedSurfaceRange, } from './region.ts';
 export { eventsToCoreMessages, projectEvent, surfaceEventsOf, extractEventText } from './messages.ts';
-export { ACP_SETTINGS_NAMESPACE, AcpSettingsSchema, describeSettingsChange, filterSettingsEntry, makeSettingsCommandSurface, parseSettingValue, resolveAcpSettings, SETTINGS_KEYS, SETTING_DEFAULTS, type AcpSettings, type AcpSettingsInput, type SettingsChangeEffect, type SettingsCommandSurface, type SettingsKey, } from './settings.ts';
+export { ACP_SETTINGS_NAMESPACE, AcpSettingsSchema, acpSettingsEqual, describeSettingsChange, findAcpSettingsDescriptor, makeSettingsCommandSurface, normalizeSettingsRefs, parseSettingValue, readSettingsRefs, resolveAcpSettings, SETTINGS_KEYS, SETTING_DEFAULTS, type AcpSettings, type AcpSettingsInput, type AcpSettingsInputs, type AcpSettingsRefs, type SettingsChangeEffect, type SettingsCommandSurface, type SettingsKey, type SettingsRef, } from './settings.ts';
 export interface AcpConfig {
     /**
      * The context window used for pressure decisions, in tokens. When omitted,
@@ -127,11 +127,46 @@ export interface AcpConfig {
 }
 export declare function resolveAcpConfig(config?: Partial<AcpConfig>): AcpConfig;
 /**
+ * The engine's plugin-config shape as cordis hands it to the constructor:
+ * every ordinary `AcpConfig` key plus the six settings knobs in ref-or-scalar
+ * form (`static Config` parses the knobs into `Volatile` references; direct
+ * construction may pass plain scalars). `Partial<AcpConfig>` remains
+ * assignable to this, so existing callers and tests typecheck unchanged.
+ */
+export type AcpPluginConfig = Partial<Omit<AcpConfig, SettingsKey>> & AcpSettingsInputs;
+/**
  * The ACP compaction backend. Subclasses the seam exactly like
  * `dsh-compaction-basic`; swaps summarization-driven compaction for
  * model-driven block compression without touching the agent loop.
  */
 export declare class AcpCompactionEngine extends CompactionEngine {
+    /**
+     * The plugin's cordis Config — exactly the six settings knobs, declared
+     * `volatile()` so a profile form edit (or `/acp config set`) applies to
+     * RUNNING sessions without a plugin remount: the engine keeps the live
+     * `Volatile` references and reads them on every use, never a
+     * construction-time snapshot. Ordinary keys (`prompts`, `coreOverrides`,
+     * `countTokens`, `preset`, the `auto*` registration switches, the
+     * `settingsEnabled` kill switch) are deliberately NOT declared: the loose
+     * object passes them through untouched, they stay construction-time, and
+     * the generated settings form shows exactly the volatile surface —
+     * object and function values must never reach a profile-editable form.
+     */
+    static Config: import("@deepseek-ai/schemastery").default<Schemastery.ObjectS<NoInfer<{
+        modelContextLimit: import("@deepseek-ai/schemastery").default<number, number, "volatile">;
+        autoModelContextLimit: import("@deepseek-ai/schemastery").default<boolean, boolean, "volatile-defined">;
+        nudgeMinContextLimitPct: import("@deepseek-ai/schemastery").default<number, number, "volatile">;
+        nudgeMaxContextLimitPct: import("@deepseek-ai/schemastery").default<number, number, "volatile">;
+        nudgeEmergencyThresholdPct: import("@deepseek-ai/schemastery").default<number, number, "volatile">;
+        autoNudge: import("@deepseek-ai/schemastery").default<boolean, boolean, "volatile-defined">;
+    }>>, Schemastery.ObjectT<NoInfer<{
+        modelContextLimit: import("@deepseek-ai/schemastery").default<number, number, "volatile">;
+        autoModelContextLimit: import("@deepseek-ai/schemastery").default<boolean, boolean, "volatile-defined">;
+        nudgeMinContextLimitPct: import("@deepseek-ai/schemastery").default<number, number, "volatile">;
+        nudgeMaxContextLimitPct: import("@deepseek-ai/schemastery").default<number, number, "volatile">;
+        nudgeEmergencyThresholdPct: import("@deepseek-ai/schemastery").default<number, number, "volatile">;
+        autoNudge: import("@deepseek-ai/schemastery").default<boolean, boolean, "volatile-defined">;
+    }>>, "plain">;
     /** The framework-agnostic ACP compression core, reused verbatim. */
     readonly kernel: CompressionCore;
     /** Per-session kernel state. */
@@ -155,15 +190,15 @@ export declare class AcpCompactionEngine extends CompactionEngine {
     private readonly compressCallIdsToHide;
     /** Per provider/model route the resolved window (probe failures cached too). */
     private readonly windowCache;
-    /** Live settings snapshot thunk (composition → user settings layer); swapped when the settings provider attaches (SettingsProvider.installSection). */
-    private readSettingsSource;
-    /** The settings service, captured lazily for /acp config (undefined in provider-less processes). */
-    private settingsService;
+    /** Live handles for the six settings knobs — cordis Volatile refs, or constants when constructed with scalars. */
+    private readonly settingsRefs;
+    /** The last snapshot readSettingsSource() returned — the diff-on-read baseline (undefined until the first read). */
+    private lastSettings;
     /** /acp config read/write surface. */
     readonly settingsCommand: SettingsCommandSurface;
     /** Per route the adapter's per-request output cap (the output reservation); null = undisclosed. */
     private readonly outputReservationCache;
-    constructor(ctx: Context, config?: Partial<AcpConfig>);
+    constructor(ctx: Context, config?: AcpPluginConfig);
     /**
      * Resolve the effective context window for an agent. An explicitly
      * configured `modelContextLimit` always wins (no probe). Otherwise the live
@@ -185,13 +220,46 @@ export declare class AcpCompactionEngine extends CompactionEngine {
      */
     windowFor(agent: Agent): Promise<AcpWindow>;
     /**
+     * The LIVE settings snapshot — the one read path every consumer shares.
+     *
+     * Each knob is read through its volatile reference, so a settings form
+     * edit (or `/acp config set`) lands here without a restart. The composed
+     * `preset` fills the thresholds nobody set explicitly: precedence is
+     * explicit value > preset > engine default, and reading the preset from
+     * `this.config` (an ordinary, construction-time key) keeps the fill stable
+     * while the threshold refs stay live.
+     *
+     * Change detection is DIFF-ON-READ instead of the old line's onChange
+     * callback: the diff handler must run before a consumer acts on the new
+     * value, and every acting consumer (windowFor, the pre-step nudge gate)
+     * starts by reading this method — so `windowCache.clear()` fires ahead of
+     * windowFor's own cache lookup by construction, and no provider lifecycle
+     * exists to miss. Unchanged reads fire nothing.
+     */
+    private readSettingsSource;
+    /**
+     * The host settings service, resolved lazily on EVERY call — no captured
+     * handle, so a service that unloads mid-process degrades `/acp config` to
+     * advice instead of writing into a disposed service (the 0.1.x line needed
+     * an inject disposer for exactly this; a per-call resolve cannot go stale).
+     *
+     * The `settingsEnabled` kill switch gates only this surface on the 0.2.0
+     * line: the settings form itself is generated from `static Config` and
+     * owned by the active profile — there is no per-plugin way to hide it
+     * (`configure({auto:false})` hides EVERY plugin's page), and the knobs
+     * remain live reads either way because they are plugin config, not
+     * settings-service state. A composition that disables the switch keeps a
+     * working engine with composition-row values and no `/acp config`.
+     */
+    private getSettingsService;
+    /**
      * Diff handler for runtime settings changes: drop the window cache when a
      * window-related key changed (probe FAILURES are cached too — clearing is
      * what lets the next pre-step re-probe after a fix), clear the per-turn
      * nudge dedup when nudges come back on, and warn on order anomalies
      * (accepted, never rejected — rejecting a write cannot fix an externally
-     * edited settings.yaml, and an invalid stored section would fail the next
-     * boot loud anyway).
+     * edited profile, and an invalid stored value would fail the next boot
+     * loud anyway).
      */
     private onSettingsChanged;
     /**

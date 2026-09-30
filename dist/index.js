@@ -3439,8 +3439,9 @@ function stringifyArgs(args) {
 function toolCallIdOfResultEvent(event) {
   if (event.type !== "tool/result") return null;
   const message = event.data.message;
-  const block = Array.isArray(message?.content) ? message.content.find((candidate) => candidate?.type === "tool-result") : void 0;
-  const id = block?.toolCallId ?? message?.source?.callId;
+  if (message === void 0) return null;
+  const block = Array.isArray(message.content) ? message.content.find((candidate) => candidate?.type === "tool-result") : void 0;
+  const id = message.toolCallId ?? block?.toolCallId ?? message.source?.callId;
   return typeof id === "string" ? id : null;
 }
 function buildToolCallIndex(events) {
@@ -3547,6 +3548,11 @@ function isCheckpointNode(event) {
   const source = event.data.source;
   return source?.kind === "compact-checkpoint" || source?.plugin === "compact";
 }
+function checkpointCompactionIdOf(event) {
+  if (!isCheckpointNode(event)) return void 0;
+  const source = event.data.source;
+  return typeof source?.compactionId === "string" ? source.compactionId : void 0;
+}
 var METADATA_PLUGINS = /* @__PURE__ */ new Set([
   "acp-nudge",
   // nudge echo (src/nudge.ts)
@@ -3568,7 +3574,9 @@ var REAL_CONTENT_PLUGINS = /* @__PURE__ */ new Set([
 var REAL_CONTENT_KINDS = /* @__PURE__ */ new Set([
   "runtime-context",
   "ptc-mode",
-  "user-approval"
+  "user-approval",
+  "model-selection",
+  "tool-registry"
 ]);
 var HOST_INSTRUCTION_KINDS = /* @__PURE__ */ new Set([
   "agent-instructions",
@@ -3603,9 +3611,8 @@ function isRealUserTurn(event) {
   if (event.type !== "user/message") return false;
   if (classifySurfaceEvent(event) !== "real") return false;
   const source = event.data.source;
-  if (source?.plugin !== void 0 && REAL_CONTENT_PLUGINS.has(source.plugin)) return false;
-  if (source?.kind !== void 0 && REAL_CONTENT_KINDS.has(source.kind)) return false;
-  return source?.kind !== "subagent-report" && source?.kind !== "subagent-settled";
+  if (source === void 0) return true;
+  return source.kind === "user";
 }
 
 // src/host-tokens.ts
@@ -3618,14 +3625,15 @@ function blockType(block) {
   const type = block.type;
   return typeof type === "string" ? type : void 0;
 }
-function estimateHostContent(blocks) {
-  if (typeof blocks === "string") {
-    let tokens2 = 0;
-    for (const char of blocks) {
-      tokens2 += BLOCK_OVERHEAD + Math.ceil(JSON.stringify(char).length / CHARS_PER_TOKEN);
-    }
-    return tokens2;
+function estimateStructuralBlock(block) {
+  if (blockType(block) === "image") {
+    const reference = { ...block };
+    delete reference.offloaded;
+    return BLOCK_OVERHEAD + Math.ceil(JSON.stringify(reference).length / CHARS_PER_TOKEN);
   }
+  return BLOCK_OVERHEAD + Math.ceil(JSON.stringify(block).length / CHARS_PER_TOKEN);
+}
+function estimateHostContent(blocks) {
   let tokens = 0;
   for (const block of blocks) {
     switch (blockType(block)) {
@@ -3639,12 +3647,8 @@ function estimateHostContent(blocks) {
         tokens += Math.ceil(call.name.length / CHARS_PER_TOKEN) + Math.ceil(call.arguments.length / CHARS_PER_TOKEN) + BLOCK_OVERHEAD;
         break;
       }
-      case "tool-result": {
-        tokens += estimateHostContent(block.content) + BLOCK_OVERHEAD;
-        break;
-      }
       default:
-        tokens += BLOCK_OVERHEAD + Math.ceil(JSON.stringify(block).length / CHARS_PER_TOKEN);
+        tokens += estimateStructuralBlock(block);
     }
   }
   return tokens;
@@ -3958,8 +3962,7 @@ function summarySeqIndex(events) {
   const index = /* @__PURE__ */ new Map();
   for (const event of events) {
     if (event.type !== "user/message") continue;
-    const source = event.data.source;
-    const compactionId = source?.plugin === "compact" ? source.compactionId : void 0;
+    const compactionId = checkpointCompactionIdOf(event);
     if (compactionId !== void 0 && !index.has(compactionId)) index.set(compactionId, event.seq);
   }
   return index;
@@ -4339,9 +4342,9 @@ function blockRegistry(session) {
 function blockRefForSummarySeq(session, seq) {
   const event = eventAtOf(session, seq);
   if (event?.type !== "user/message") return null;
-  const source = event.data.source;
-  if (source?.plugin !== "compact" || source.compactionId === void 0) return null;
-  const entry = blockRegistry(session).find((r) => r.blockId === source.compactionId);
+  const compactionId = checkpointCompactionIdOf(event);
+  if (compactionId === void 0) return null;
+  const entry = blockRegistry(session).find((r) => r.blockId === compactionId);
   if (entry === void 0) return null;
   return entry.kernelBlockId;
 }
@@ -4362,9 +4365,7 @@ function summarySeqOfKernelBlock(session, kernelBlockId) {
 function checkpointBlockIdOf(events, seq) {
   const event = events[seq];
   if (event?.type !== "user/message") return null;
-  const source = event.data.source;
-  if (source?.plugin !== "compact" || source.compactionId === void 0) return null;
-  return source.compactionId;
+  return checkpointCompactionIdOf(event) ?? null;
 }
 function expandShadowedSeqs(session, blockId) {
   const ledger = rebuildBlockLedger(sessionEventsOf(session));
@@ -5529,10 +5530,11 @@ function makeTools(env) {
 }
 
 // src/commands.ts
-import { SettingsConflictError } from "@deepseek-ai/dsh-settings";
+import { SettingsConflictError as SettingsConflictError2 } from "@deepseek-ai/dsh-settings";
 
 // src/settings.ts
 import z from "@deepseek-ai/schemastery";
+import { SettingsConflictError } from "@deepseek-ai/dsh-settings";
 var ACP_SETTINGS_NAMESPACE = "compaction-acp";
 var SETTINGS_KEYS = [
   "modelContextLimit",
@@ -5548,15 +5550,40 @@ var SETTING_DEFAULTS = {
   nudgeEmergencyThresholdPct: 0.85,
   autoNudge: true
 };
-function filterSettingsEntry(entry) {
+var AcpSettingsSchema = z.object({
+  modelContextLimit: z.number().step(1).min(1).volatile(),
+  autoModelContextLimit: z.boolean().default(SETTING_DEFAULTS.autoModelContextLimit).volatile(),
+  nudgeMinContextLimitPct: z.number().min(0).max(1).volatile(),
+  nudgeMaxContextLimitPct: z.number().min(0).max(1).volatile(),
+  nudgeEmergencyThresholdPct: z.number().min(0).max(1).volatile(),
+  autoNudge: z.boolean().default(SETTING_DEFAULTS.autoNudge).volatile()
+});
+function isRef(value) {
+  return typeof value === "object" && value !== null && typeof value.get === "function";
+}
+function normalizeSettingsRefs(inputs) {
+  const one = (value) => isRef(value) ? value : { get: () => value };
   return {
-    ...entry.modelContextLimit !== void 0 ? { modelContextLimit: entry.modelContextLimit } : {},
-    ...entry.autoModelContextLimit !== void 0 ? { autoModelContextLimit: entry.autoModelContextLimit } : {},
-    ...entry.nudgeMinContextLimitPct !== void 0 ? { nudgeMinContextLimitPct: entry.nudgeMinContextLimitPct } : {},
-    ...entry.nudgeMaxContextLimitPct !== void 0 ? { nudgeMaxContextLimitPct: entry.nudgeMaxContextLimitPct } : {},
-    ...entry.nudgeEmergencyThresholdPct !== void 0 ? { nudgeEmergencyThresholdPct: entry.nudgeEmergencyThresholdPct } : {},
-    ...entry.autoNudge !== void 0 ? { autoNudge: entry.autoNudge } : {}
+    modelContextLimit: one(inputs.modelContextLimit),
+    autoModelContextLimit: one(inputs.autoModelContextLimit),
+    nudgeMinContextLimitPct: one(inputs.nudgeMinContextLimitPct),
+    nudgeMaxContextLimitPct: one(inputs.nudgeMaxContextLimitPct),
+    nudgeEmergencyThresholdPct: one(inputs.nudgeEmergencyThresholdPct),
+    autoNudge: one(inputs.autoNudge)
   };
+}
+function readSettingsRefs(refs) {
+  return {
+    modelContextLimit: refs.modelContextLimit.get(),
+    autoModelContextLimit: refs.autoModelContextLimit.get(),
+    nudgeMinContextLimitPct: refs.nudgeMinContextLimitPct.get(),
+    nudgeMaxContextLimitPct: refs.nudgeMaxContextLimitPct.get(),
+    nudgeEmergencyThresholdPct: refs.nudgeEmergencyThresholdPct.get(),
+    autoNudge: refs.autoNudge.get()
+  };
+}
+function acpSettingsEqual(a, b) {
+  return a.modelContextLimit === b.modelContextLimit && a.autoModelContextLimit === b.autoModelContextLimit && a.nudgeMinContextLimitPct === b.nudgeMinContextLimitPct && a.nudgeMaxContextLimitPct === b.nudgeMaxContextLimitPct && a.nudgeEmergencyThresholdPct === b.nudgeEmergencyThresholdPct && a.autoNudge === b.autoNudge;
 }
 function resolveAcpSettings(input) {
   return {
@@ -5568,14 +5595,6 @@ function resolveAcpSettings(input) {
     autoNudge: input.autoNudge ?? SETTING_DEFAULTS.autoNudge
   };
 }
-var AcpSettingsSchema = z.object({
-  modelContextLimit: z.number().step(1).min(1),
-  autoModelContextLimit: z.boolean().default(SETTING_DEFAULTS.autoModelContextLimit),
-  nudgeMinContextLimitPct: z.number().min(0).max(1),
-  nudgeMaxContextLimitPct: z.number().min(0).max(1).default(SETTING_DEFAULTS.nudgeMaxContextLimitPct),
-  nudgeEmergencyThresholdPct: z.number().min(0).max(1).default(SETTING_DEFAULTS.nudgeEmergencyThresholdPct),
-  autoNudge: z.boolean().default(SETTING_DEFAULTS.autoNudge)
-});
 function describeSettingsChange(prev, next) {
   const warnings = [];
   if (next.nudgeMinContextLimitPct !== void 0 && next.nudgeMinContextLimitPct >= next.nudgeMaxContextLimitPct) {
@@ -5606,29 +5625,41 @@ function parseSettingValue(raw) {
     reason: `"${text}" is not a valid value \u2014 use a number (0.65), true/false, or null to reset the key`
   };
 }
-function requireService(getService) {
-  const service = getService();
-  if (service === void 0) {
-    throw new Error("runtime settings are not available in this process");
-  }
-  return service;
+function findAcpSettingsDescriptor(service) {
+  return service.describe().find((descriptor) => String(descriptor.ns) === ACP_SETTINGS_NAMESPACE);
 }
 function makeSettingsCommandSurface(getService, getSnapshot) {
+  const requireDescriptor = (service) => {
+    const descriptor = findAcpSettingsDescriptor(service);
+    if (descriptor === void 0) {
+      throw new Error(
+        `no settings entry "${ACP_SETTINGS_NAMESPACE}" \u2014 the engine must be mounted under a composition row with that id for /acp config to reach it`
+      );
+    }
+    return { descriptor };
+  };
   return {
     get available() {
-      return getService() !== void 0;
+      const service = getService();
+      return service !== void 0 && findAcpSettingsDescriptor(service) !== void 0;
     },
     snapshot: getSnapshot,
     describe() {
       const service = getService();
       if (service === void 0) return void 0;
-      return service.describe().find((descriptor) => String(descriptor.ns) === ACP_SETTINGS_NAMESPACE);
+      return findAcpSettingsDescriptor(service);
     },
     async update(patch) {
-      await requireService(getService).update(ACP_SETTINGS_NAMESPACE, patch);
+      const service = getService();
+      if (service === void 0) throw new Error("runtime settings are not available in this process");
+      const { descriptor } = requireDescriptor(service);
+      await service.update(ACP_SETTINGS_NAMESPACE, patch, descriptor.revision);
     },
     async replaceSection(section) {
-      await requireService(getService).replace(ACP_SETTINGS_NAMESPACE, section);
+      const service = getService();
+      if (service === void 0) throw new Error("runtime settings are not available in this process");
+      const { descriptor } = requireDescriptor(service);
+      await service.replace(ACP_SETTINGS_NAMESPACE, section, descriptor.revision);
     }
   };
 }
@@ -5829,7 +5860,7 @@ function isSettingsKey(key) {
   return SETTINGS_KEYS.includes(key);
 }
 function settingsWriteFailure(error) {
-  if (error instanceof SettingsConflictError) {
+  if (error instanceof SettingsConflictError2) {
     return "conflict: another writer changed this setting at the same time \u2014 run /acp config again";
   }
   return `rejected: ${String(error)}`;
@@ -5978,6 +6009,19 @@ function assertNudgeThresholdOrder(config) {
   }
 }
 var AcpCompactionEngine = class extends CompactionEngine {
+  /**
+   * The plugin's cordis Config — exactly the six settings knobs, declared
+   * `volatile()` so a profile form edit (or `/acp config set`) applies to
+   * RUNNING sessions without a plugin remount: the engine keeps the live
+   * `Volatile` references and reads them on every use, never a
+   * construction-time snapshot. Ordinary keys (`prompts`, `coreOverrides`,
+   * `countTokens`, `preset`, the `auto*` registration switches, the
+   * `settingsEnabled` kill switch) are deliberately NOT declared: the loose
+   * object passes them through untouched, they stay construction-time, and
+   * the generated settings form shows exactly the volatile surface —
+   * object and function values must never reach a profile-editable form.
+   */
+  static Config = AcpSettingsSchema;
   /** The framework-agnostic ACP compression core, reused verbatim. */
   kernel;
   /** Per-session kernel state. */
@@ -6001,69 +6045,44 @@ var AcpCompactionEngine = class extends CompactionEngine {
   compressCallIdsToHide = /* @__PURE__ */ new Set();
   /** Per provider/model route the resolved window (probe failures cached too). */
   windowCache = /* @__PURE__ */ new Map();
-  /** Live settings snapshot thunk (composition → user settings layer); swapped when the settings provider attaches (SettingsProvider.installSection). */
-  readSettingsSource = () => resolveAcpSettings({});
-  /** The settings service, captured lazily for /acp config (undefined in provider-less processes). */
-  settingsService;
+  /** Live handles for the six settings knobs — cordis Volatile refs, or constants when constructed with scalars. */
+  settingsRefs;
+  /** The last snapshot readSettingsSource() returned — the diff-on-read baseline (undefined until the first read). */
+  lastSettings;
   /** /acp config read/write surface. */
   settingsCommand;
   /** Per route the adapter's per-request output cap (the output reservation); null = undisclosed. */
   outputReservationCache = /* @__PURE__ */ new Map();
   constructor(ctx, config = {}) {
     super(ctx);
-    this.config = resolveAcpConfig(config);
+    this.settingsRefs = normalizeSettingsRefs(config);
+    const knobs = readSettingsRefs(this.settingsRefs);
+    this.config = resolveAcpConfig({
+      ...config,
+      modelContextLimit: knobs.modelContextLimit,
+      autoModelContextLimit: knobs.autoModelContextLimit,
+      nudgeMinContextLimitPct: knobs.nudgeMinContextLimitPct,
+      nudgeMaxContextLimitPct: knobs.nudgeMaxContextLimitPct,
+      nudgeEmergencyThresholdPct: knobs.nudgeEmergencyThresholdPct,
+      autoNudge: knobs.autoNudge
+    });
     this.prompts = resolvePrompts2(config.prompts);
     const ports = this.config.countTokens !== void 0 ? { countTokens: this.config.countTokens } : {};
     this.kernel = createCore(ports);
     setDocCacheCap(128 * 1024 * 1024);
     this.store = new AcpStateStore();
-    const compositionEntry = filterSettingsEntry(config);
-    let current = resolveAcpSettings(compositionEntry);
-    this.readSettingsSource = () => current;
+    this.settingsCommand = makeSettingsCommandSurface(
+      () => this.getSettingsService(),
+      () => this.readSettingsSource()
+    );
     const engine = this;
-    const applySettings = () => {
-      const next = this.readSettingsSource();
-      const prev = current;
-      current = next;
-      try {
-        engine.onSettingsChanged(prev, next);
-      } catch (error) {
-        this.ctx.logger.warn(`billion-context-dsh: applying settings change failed: ${String(error)}`);
-      }
-    };
-    this.settingsCommand = makeSettingsCommandSurface(() => this.settingsService, () => current);
-    if (this.config.settingsEnabled !== false) {
-      ctx.inject(["settings"], (settingsCtx) => {
-        if (typeof settingsCtx.settings.installSection !== "function") {
-          this.settingsService = settingsCtx.settings;
-          return () => {
-            this.settingsService = void 0;
-          };
-        }
-        settingsCtx.settings.installSection(ctx, ACP_SETTINGS_NAMESPACE, AcpSettingsSchema, compositionEntry, {
-          // The seam's source type follows the entry it registered, so `source`
-          // is a partial view of the settings; re-resolve it into a
-          // fully-defaulted snapshot so every reader sees the same shape the
-          // composition path produced.
-          setSource: (source) => {
-            this.readSettingsSource = () => resolveAcpSettings(source());
-          },
-          onChange: applySettings
-        });
-        this.settingsService = settingsCtx.settings;
-        return () => {
-          this.settingsService = void 0;
-          this.readSettingsSource = () => current;
-        };
-      });
-    }
     const env = {
       kernel: this.kernel,
       store: this.store,
-      // The settings-exposed knobs read LIVE from the settings source, so a
-      // settings.yaml edit (or /acp config set) hot-applies to every
-      // subsequent call — consumers never see stale numbers. (ToolEnvironment
-      // fields are readonly properties; getters satisfy them.)
+      // The settings-exposed knobs read LIVE from the volatile refs, so a
+      // settings form edit (or /acp config set) hot-applies to every
+      // subsequent call — consumers never see stale numbers.
+      // (ToolEnvironment fields are readonly properties; getters satisfy them.)
       get modelContextLimit() {
         return engine.readSettingsSource().modelContextLimit ?? DEFAULT_CONTEXT_WINDOW;
       },
@@ -6121,10 +6140,8 @@ var AcpCompactionEngine = class extends CompactionEngine {
     }
     ctx.on("session/event", (session, event) => {
       if (event.type !== "tool/result") return;
-      const message = event.data.message;
-      const block = message.content[0];
-      const callId = block?.toolCallId ?? message.source.callId;
-      if (typeof callId !== "string" || !this.compressCallIdsToHide.has(callId)) return;
+      const callId = toolCallIdOfResultEvent(event);
+      if (callId === null || !this.compressCallIdsToHide.has(callId)) return;
       this.compressCallIdsToHide.delete(callId);
       deferCompressPairHide(session, callId, event.seq, (error) => {
         ctx.logger.warn(`billion-context-dsh: hide compress call/result pair failed: ${String(error)}`);
@@ -6232,13 +6249,70 @@ var AcpCompactionEngine = class extends CompactionEngine {
     return window;
   }
   /**
+   * The LIVE settings snapshot — the one read path every consumer shares.
+   *
+   * Each knob is read through its volatile reference, so a settings form
+   * edit (or `/acp config set`) lands here without a restart. The composed
+   * `preset` fills the thresholds nobody set explicitly: precedence is
+   * explicit value > preset > engine default, and reading the preset from
+   * `this.config` (an ordinary, construction-time key) keeps the fill stable
+   * while the threshold refs stay live.
+   *
+   * Change detection is DIFF-ON-READ instead of the old line's onChange
+   * callback: the diff handler must run before a consumer acts on the new
+   * value, and every acting consumer (windowFor, the pre-step nudge gate)
+   * starts by reading this method — so `windowCache.clear()` fires ahead of
+   * windowFor's own cache lookup by construction, and no provider lifecycle
+   * exists to miss. Unchanged reads fire nothing.
+   */
+  readSettingsSource() {
+    const refs = this.settingsRefs;
+    const preset = this.config.preset === void 0 ? void 0 : resolvePreset(this.config.preset);
+    const next = resolveAcpSettings({
+      modelContextLimit: refs.modelContextLimit.get(),
+      autoModelContextLimit: refs.autoModelContextLimit.get(),
+      nudgeMinContextLimitPct: refs.nudgeMinContextLimitPct.get() ?? preset?.nudgeMinContextLimitPct,
+      nudgeMaxContextLimitPct: refs.nudgeMaxContextLimitPct.get() ?? preset?.nudgeMaxContextLimitPct,
+      nudgeEmergencyThresholdPct: refs.nudgeEmergencyThresholdPct.get() ?? preset?.nudgeEmergencyThresholdPct,
+      autoNudge: refs.autoNudge.get()
+    });
+    const prev = this.lastSettings;
+    this.lastSettings = next;
+    if (prev !== void 0 && !acpSettingsEqual(prev, next)) {
+      try {
+        this.onSettingsChanged(prev, next);
+      } catch (error) {
+        this.ctx.logger.warn(`billion-context-dsh: applying settings change failed: ${String(error)}`);
+      }
+    }
+    return next;
+  }
+  /**
+   * The host settings service, resolved lazily on EVERY call — no captured
+   * handle, so a service that unloads mid-process degrades `/acp config` to
+   * advice instead of writing into a disposed service (the 0.1.x line needed
+   * an inject disposer for exactly this; a per-call resolve cannot go stale).
+   *
+   * The `settingsEnabled` kill switch gates only this surface on the 0.2.0
+   * line: the settings form itself is generated from `static Config` and
+   * owned by the active profile — there is no per-plugin way to hide it
+   * (`configure({auto:false})` hides EVERY plugin's page), and the knobs
+   * remain live reads either way because they are plugin config, not
+   * settings-service state. A composition that disables the switch keeps a
+   * working engine with composition-row values and no `/acp config`.
+   */
+  getSettingsService() {
+    if (this.config.settingsEnabled === false) return void 0;
+    return this.ctx.get("settings");
+  }
+  /**
    * Diff handler for runtime settings changes: drop the window cache when a
    * window-related key changed (probe FAILURES are cached too — clearing is
    * what lets the next pre-step re-probe after a fix), clear the per-turn
    * nudge dedup when nudges come back on, and warn on order anomalies
    * (accepted, never rejected — rejecting a write cannot fix an externally
-   * edited settings.yaml, and an invalid stored section would fail the next
-   * boot loud anyway).
+   * edited profile, and an invalid stored value would fail the next boot
+   * loud anyway).
    */
   onSettingsChanged(prev, next) {
     const effect = describeSettingsChange(prev, next);
@@ -6314,6 +6388,7 @@ export {
   SETTINGS_KEYS,
   SETTING_DEFAULTS,
   acpCommand,
+  acpSettingsEqual,
   assertNoActiveCompaction,
   blockRefForSummarySeq,
   blockRegistry,
@@ -6325,16 +6400,18 @@ export {
   eventsToCoreMessages,
   expandShadowedSeqs,
   extractEventText,
-  filterSettingsEntry,
+  findAcpSettingsDescriptor,
   findOpenTurn,
   hideCompressToolPair,
   isPresetName,
   kernelConfigFor,
   makeSettingsCommandSurface,
   makeTools,
+  normalizeSettingsRefs,
   parseSettingValue,
   projectEvent,
   projectedContextWindow,
+  readSettingsRefs,
   rebuildBlockLedger,
   renderSystemPrompt,
   renderTemplate,

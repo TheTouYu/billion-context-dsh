@@ -41,25 +41,26 @@ export type HostBlock = {
 } | {
     type: 'tool-result';
     toolCallId: string;
-    content: HostContent;
+    content: readonly HostBlock[] | string;
 } | ({
     type?: string;
 } & Record<string, unknown>);
-/** A content block list, or a bare string (`tool-result` content may be either). */
-export type HostContent = readonly HostBlock[] | string;
 /**
  * Exact mirror of the host's `estimateContent`
- * (`@deepseek-ai/dsh-token-meter/lib/types/estimate.js`): text/reasoning
- * `ceil(len/4)+4`, tool-call `ceil(name/4)+ceil(arguments/4)+4`, tool-result
- * recursive over its content, unknown blocks `4+ceil(JSON.stringify/4)` over
- * the ORIGINAL block object. A string content is iterated as an iterable, so
- * every CHARACTER falls to the default branch (`4+ceil(JSON.stringify(char)/4)`
- * — 5 tokens for any single unescaped character).
+ * (`@deepseek-ai/dsh-token-meter/lib/types/estimate.js`, 0.2.0 estimator):
+ * text/reasoning `ceil(len/4)+4`, tool-call `ceil(name/4)+ceil(arguments/4)+4`,
+ * and EVERY other block — including `tool-result` and image references —
+ * through the structural arm above. The 0.1.5 estimator recursed into
+ * `tool-result` content; that arm is GONE on this line (stateVersion 5), so a
+ * legacy nested `tool-result` block (0.1.5/0.1.7 logs) prices as
+ * `4+ceil(JSON.stringify(whole block)/4)` — which is also what the LIVE meter
+ * does when it re-prices those rows, so the mirror stays exact against the
+ * same claim basis.
  */
-export declare function estimateHostContent(blocks: HostContent): number;
+export declare function estimateHostContent(blocks: readonly HostBlock[]): number;
 /** Exact mirror of the host's `estimateMessage` (content + role framing). */
 export declare function estimateHostMessage(message: {
-    content: HostContent;
+    content: readonly HostBlock[];
 }): number;
 /**
  * Host price of ONE session event under the mirror: project it through the

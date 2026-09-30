@@ -26,10 +26,14 @@ export declare function extractText(content: unknown): string;
 /**
  * The tool-call id of one tool/result surface message, or null.
  *
- * Real DSH tool-result events carry NO `message.toolCallId` (hard-won rule
- * 10): the identity lives in the nested `{ type: 'tool-result', toolCallId }`
- * content block, falling back to `message.source.callId`. Shared with
- * `src/region.ts`'s call/result pairing — one implementation, never a copy.
+ * On the 0.1.7+/0.2.0 shape the id is the message's TOP-LEVEL
+ * `toolCallId` (the nested `tool-result` content block no longer carries
+ * it and the message role is `tool`); the legacy fallbacks stay because
+ * sessions committed on the 0.1.5 line keep their old rows when resumed —
+ * nested-block `toolCallId` first, then `message.source.callId` (which the
+ * current line stamps on every tool/result anyway). Shared with
+ * `src/region.ts`'s call/result pairing and the engine's compress-pair
+ * hide — one implementation, never a copy (hard-won rule 10).
  */
 export declare function toolCallIdOfResultEvent(event: SessionEvent): string | null;
 /**
@@ -84,6 +88,13 @@ export declare function extractEventText(event: SessionEvent): string;
  */
 export declare function isCheckpointNode(event: SessionEvent): boolean;
 /**
+ * The durable compaction id a checkpoint node carries, in EITHER host shape
+ * (see {@link isCheckpointNode}). Shared by the region.ts seq/registry
+ * readers so writer and readers can never disagree on identity; returns
+ * undefined for plain messages and malformed checkpoints (no string id).
+ */
+export declare function checkpointCompactionIdOf(event: SessionEvent): string | undefined;
+/**
  * Injection/authoring classification of one surface event — the ONE shared
  * classifier for range scanning and the protected-tail scan (never ad-hoc
  * predicates that drift apart).
@@ -129,13 +140,25 @@ export declare const METADATA_KINDS: ReadonlySet<string>;
  * for {@link METADATA_KINDS}, so a kind can never be authored that the
  * classifier below does not recognise as engine metadata.
  *
- * The assertion covers 0.1.5's `MessageSourceMap`, which has no member for a
- * plugin-owned kind. Both versions type `MessageSource` as
- * `MessageSourceMap[keyof MessageSourceMap]` — an OPEN interface — and both
- * pass `user/message` rows through their runtime validation, so the value is
- * legal at run time in either version; only the pre-0.1.7 type needs the cast.
+ * The kinds are declared in `MessageSourceMap` (augmentation below), so the
+ * object the host's `user/message` validation and the session format see is
+ * also the object the type system checks.
  */
 export declare function engineSource(kind: 'acp-nudge' | 'billion-context-dsh', form: string): MessageSource;
+declare module '@deepseek-ai/dsh-llm' {
+    interface MessageSourceMap {
+        /** Forced-nudge echo rows written by the engine (form 'nudge'). */
+        'acp-nudge': {
+            kind: 'acp-nudge';
+            form: string;
+        };
+        /** Engine-authored replacement rows: the visible prune tombstone (form 'prune-tombstone'). */
+        'billion-context-dsh': {
+            kind: 'billion-context-dsh';
+            form: string;
+        };
+    }
+}
 /**
  * True for AGENTS.md instruction rows in BOTH host shapes: the hook shape
  * (`kind:'agent-instructions'`, form 'instructions') and the baseline shape
