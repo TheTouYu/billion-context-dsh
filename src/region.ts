@@ -22,6 +22,7 @@ import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defaultCountTokens } from 'acp-kernel'
 import {
   classifySurfaceEvent,
+  checkpointCompactionIdOf,
   engineSource,
   extractEventText,
   extractText,
@@ -537,8 +538,9 @@ function summarySeqIndex(events: readonly SessionEvent[]): Map<string, number> {
   const index = new Map<string, number>()
   for (const event of events) {
     if (event.type !== 'user/message') continue
-    const source = (event.data as { source?: { plugin?: string; compactionId?: string } }).source
-    const compactionId = source?.plugin === 'compact' ? source.compactionId : undefined
+    // Both host shapes (compact-checkpoint marker / legacy plugin row) —
+    // sessions committed before the upgrade still carry the legacy node.
+    const compactionId = checkpointCompactionIdOf(event)
     if (compactionId !== undefined && !index.has(compactionId)) index.set(compactionId, event.seq)
   }
   return index
@@ -1279,9 +1281,10 @@ export function blockRegistry(session: Session): AcpBlockRegistryEntry[] {
 export function blockRefForSummarySeq(session: Session, seq: number): string | null {
   const event = eventAtOf(session, seq)
   if (event?.type !== 'user/message') return null
-  const source = (event.data as { source?: { plugin?: string; compactionId?: string } }).source
-  if (source?.plugin !== 'compact' || source.compactionId === undefined) return null
-  const entry = blockRegistry(session).find((r) => r.blockId === source.compactionId)
+  // Both host shapes — see checkpointCompactionIdOf.
+  const compactionId = checkpointCompactionIdOf(event)
+  if (compactionId === undefined) return null
+  const entry = blockRegistry(session).find((r) => r.blockId === compactionId)
   if (entry === undefined) return null
   return entry.kernelBlockId
 }
@@ -1319,9 +1322,8 @@ export function summarySeqOfKernelBlock(session: Session, kernelBlockId: string)
 function checkpointBlockIdOf(events: readonly SessionEvent[], seq: number): string | null {
   const event = events[seq]
   if (event?.type !== 'user/message') return null
-  const source = (event.data as { source?: { plugin?: string; compactionId?: string } }).source
-  if (source?.plugin !== 'compact' || source.compactionId === undefined) return null
-  return source.compactionId
+  // Both host shapes — see checkpointCompactionIdOf.
+  return checkpointCompactionIdOf(event) ?? null
 }
 
 /**

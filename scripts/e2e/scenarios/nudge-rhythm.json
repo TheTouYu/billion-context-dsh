@@ -8,8 +8,8 @@
   { "filler": { "topic": "region", "count": 80 } },
   { "filler": { "topic": "pairing", "count": 80 } },
   { "filler": { "topic": "replay", "count": 80 } },
-  { "filler": { "topic": "big", "count": 260 } },
-  { "filler": { "topic": "big", "count": 260 } }
+  { "filler": { "topic": "big", "count": 420 } },
+  { "filler": { "topic": "big", "count": 420 } }
 ],
   "responses": [
   { "kind": "text", "text": "Noted." },

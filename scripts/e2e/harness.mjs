@@ -46,20 +46,39 @@ const updateSeqs = (events, seqs) => {
 const runScenario = async (scenario) => {
   const seqs = {}
   const server = await startFakeLlm({ port: 0, turns: expand(scenario.responses), seqs })
-  process.env.DEEPSEEK_BASE_URL = `${server.baseURL}/v1`
-  process.env.DEEPSEEK_API_KEY = 'mock-key'
   const { Context } = await import('@deepseek-ai/cordis')
   const { SessionId } = await import('@deepseek-ai/dsh-session')
   const { createUserMessage } = await import('@deepseek-ai/dsh-llm')
   const AgentLoop = (await import('@deepseek-ai/dsh-agent-loop')).default
   const { mountAgentLoopTestDependencies } = await import('@deepseek-ai/dsh-agent-loop-testkit')
-  const LlmDeepSeek = await import('@deepseek-ai/dsh-llm-deepseek')
+  const deepseek = await import('@deepseek-ai/dsh-llm-deepseek')
   const TokenMeter = (await import('@deepseek-ai/dsh-token-meter')).default
   const AcpEngine = (await import(String(ENGINE))).default
   const ctx = new Context()
-  await mountAgentLoopTestDependencies(ctx, { systemPrompt: { persona: scenario.persona } })
+  await mountAgentLoopTestDependencies(ctx)
   await ctx.plugin(AgentLoop, { agents: [] })
-  await ctx.plugin(LlmDeepSeek, { models: [{ id: 'deepseek-v4-flash', contextWindow: scenario.engine.modelContextLimit }] })
+  // 0.2.0 replaced the plugin-class adapter with an imperative host seam:
+  // registerDeepSeekProvider(ctx, provider, deps) builds the DeepSeekAdapter
+  // itself but injects a settings service (to disable its auto entry), so a
+  // minimal no-op provider rides this context first. The Connection object
+  // comes from resolveAdapterOptions — the same validation path the product
+  // uses — from just a baseURL and the scenario's model catalog.
+  ctx.provide('settings', {
+    writable: false,
+    describe: () => [],
+    configure: () => () => {}
+  })
+  const connection = deepseek.resolveAdapterOptions({
+    baseURL: `${server.baseURL}/v1`,
+    models: [{ id: 'deepseek-v4-flash', contextWindow: scenario.engine.modelContextLimit }]
+  })
+  ctx.inject(['llm'], (child) => {
+    deepseek.registerDeepSeekProvider(child, 'deepseek-official', {
+      options: () => connection,
+      resolveAuth: async () => ({ headers: { authorization: 'Bearer mock-key' } }),
+      discoverModels: async () => connection.models.map((model) => deepseek.catalogModelInfo('deepseek-official', model))
+    })
+  })
   await ctx.plugin(TokenMeter)
   await ctx.plugin(AcpEngine, { ...scenario.engine })
   const agent = await ctx.agentLoop.create(SessionId(scenario.name), {

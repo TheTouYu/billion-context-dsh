@@ -74,12 +74,16 @@ dsh plugin --profile web add billion-context-dsh
 > **与 DSH 版本的兼容性。** 包把五个运行期 seam 包（`dsh-compaction` /
 > `dsh-session` / `dsh-llm` / `dsh-tools` / `dsh-settings`）都声明为 peer
 > 依赖，共享同一个
-> 范围 `>=0.1.5-alpha.1 <0.1.6-0`——恰好是整条 `0.1.5` 线（所有预发布加最终
-> `0.1.5`）。从 `0.1.5` 线起，会话 replace 操作的协议字段由 `{ op, start, end }`
-> 改名为 `{ op, startSeq, endSeq }`，且校验严格（只接受这三个字段）；本引擎只
-> 输出新形态，因此在更旧的 DSH（< 0.1.5）上每次 `compress` 都会被宿主在运行时
-> 拒绝（issue #136）——旧版本不再受支持，请先升级 DSH 再安装本发行版。范围
-> 写成显式区间而非 caret 是**有意为之**：caret 会悄悄放进未经验证的 0.1.6+
+> 范围 `>=0.2.0-rc.1 <0.2.1-0`——恰好是整条 `0.2.0` 线（所有预发布加最终
+> `0.2.0`）。基线从 0.1.5 上移到 0.2.0，因为 0.2.0 是又一次**破坏性接缝变更**：
+> ① tool/result 角色重构——`role: 'tool'` 且 `toolCallId`/`isError`/`content`
+> 移到消息顶层；② compaction checkpoint 标记改为 `kind: 'compact-checkpoint'`；
+> ③ settings 接缝换成 SettingsForms 模型（插件声明 `static Config` schema，
+> 宿主生成设置表单）。本引擎只输出 0.2.0 形态（旧 0.1.x 形状仅作历史日志回读
+> 兜底），replace 方言沿用 0.1.5 起的 `{ op, startSeq, endSeq }`——更旧的 DSH
+> 上每次 `compress` 都会被宿主在运行时拒绝（issue #136），旧版本不再受支持，
+> 请先升级 DSH 再安装本发行版。范围
+> 写成显式区间而非 caret 是**有意为之**：caret 会悄悄放进未经验证的 0.2.1+
 > 线。把这五个 seam 包一并声明为 peer（而不只是 `dsh-compaction`），是为了让
 > 安装在 pnpm 的集成/封存布局下仍能把它们解析到**宿主自己的副本**，而不是
 > 某个与宿主不一致的陈旧嵌套副本。
@@ -148,23 +152,17 @@ dsh plugin --profile web add github:Tyan66666/billion-context-dsh#v0.2.21
 
 可配置槽位清单、每槽可用占位符、空串/`null` 语义见 [docs/configurable-prompts-design.md](docs/configurable-prompts-design.md)。未配置 `prompts` 的部署直接使用 kernel 渲染（对齐 kernel/pi，见设计文档 v6）。
 
-**（可选）运行时设置 —— 编辑 `~/.dsh/settings.yaml` 或 `/acp config`，无需重启。** 六个标量键（`modelContextLimit`、`autoModelContextLimit`、`nudgeMinContextLimitPct`、`nudgeMaxContextLimitPct`、`nudgeEmergencyThresholdPct`、`autoNudge`，见「配置」表中带「运行时热调」标记的行）在宿主 settings 层有一份可热改的副本：编辑 settings 文件或 `/acp config` 会**立即生效于运行中的会话**（组合行 `config:` 仍是起点——分层为 schema 默认 → 组合行 → 用户 settings 段）：
-
-```yaml
-# ~/.dsh/settings.yaml
-compaction-acp:
-  nudgeMaxContextLimitPct: 0.72   # 保存即生效，无需重启
-```
+**（可选）运行时设置 —— 宿主设置页或 `/acp config`，无需重启。** 插件向宿主声明六个标量键的配置 schema（`static Config`，DSH 0.2.0 的 SettingsForms 模型：`modelContextLimit`、`autoModelContextLimit`、`nudgeMinContextLimitPct`、`nudgeMaxContextLimitPct`、`nudgeEmergencyThresholdPct`、`autoNudge`，见「配置」表中带「运行时热调」标记的行），宿主据此**自动生成设置表单页**——在 DSH 设置界面改值或用 `/acp config` 改值都会**立即生效于运行中的会话**（旋钮以 live ref 逐次读取，不是启动快照；分层为 schema 默认 → 继承的组合层 → 当前 profile 对 `compaction-acp` 条目的覆盖）：
 
 ```text
 /acp config                                  # 列出六个键当前值 + 来源层（user / base / default）
-/acp config set nudgeMaxContextLimitPct 0.72 # 热改一个键
+/acp config set nudgeMaxContextLimitPct 0.72 # 热改一个键（revision 保护：与他人并发写冲突时明确报错、提示重试）
 /acp config set autoNudge false              # 布尔键（false 是合法值）
-/acp config reset nudgeMaxContextLimitPct    # 退回组合行 / 引擎默认
+/acp config reset nudgeMaxContextLimitPct    # 退回组合层 / 引擎默认（只删该键，不动你手写的其他键）
 /acp config reset all
 ```
 
-窗口相关键（`modelContextLimit` / `autoModelContextLimit`）改动会清空窗口探测缓存——下一次 pre-step 按新值重新探测（探测失败也会被缓存，正是靠这个机制在修复网关后重新探测）。无 settings provider 的纯 npm 安装组合下 `/acp config` 降级为指引文案；`settingsEnabled: false` 可整体关闭该集成（组合行专用，不进 settings 层——开关不能关掉自己）。设计细节见 [docs/settings-integration-design.md](docs/settings-integration-design.md)。
+窗口相关键（`modelContextLimit` / `autoModelContextLimit`）改动会清空窗口探测缓存——下一次 pre-step 按新值重新探测（探测失败也会被缓存，正是靠这个机制在修复网关后重新探测）。三个 nudge 阈值在 schema 里**不带默认值**：未显式设置时组合层的 `preset` 仍能填上它们（表单空控件即「继承」的诚实显示）。0.1.x 的 `~/.dsh/settings.yaml` `compaction-acp:` 段由宿主在首次启动时自动导入组合条目，无需手工迁移。无 settings 服务的纯 npm 安装组合下 `/acp config` 降级为指引文案；`settingsEnabled: false` 只关闭 `/acp config` 命令面（表单页由宿主从 schema 生成、归 profile 所有，插件无法单方面隐藏）。设计细节见 [docs/settings-integration-design.md](docs/settings-integration-design.md)。
 
 **单模式生效（agent preset 的 `compaction` realm）**。先在该 realm 内*禁用（或删除）原有的 `dsh-compaction-basic` 行*，再插入本引擎——同一 realm 内两个后端不能并存：
 
@@ -242,12 +240,12 @@ DSH 的每个模型请求都派生自其 append-only 会话日志（*surface*）
 | `nudgeMinContextLimitPct` | 内核默认 `0.45` | Nudge 窗口下界（用量占比）——仅作配置校验，增长路径的触发没有百分比下限——与 billion-context-pi 相同的默认值（运行时热调：`/acp config`） |
 | `nudgeMaxContextLimitPct` | engine 默认 `0.70`（内核/pi 默认 `0.75`） | 过限线：超过此值则无论增长与否都触发 nudge——刻意低于宿主 compaction-basic 的 80% 自动压缩线，保证强制 nudge 先触发；显式配置优先（`coreOverrides.nudge` 同名键优先级更高，见下）（运行时热调：`/acp config`） |
 | `nudgeEmergencyThresholdPct` | engine 默认 `0.85`（内核/pi 默认 `0.95`） | 紧急 nudge（绕过每轮去重，但每个 user turn 最多注入 3 次——issue #108）——从 `0.95` 下调：95% 时模型已无操作空间且会被 80% 自动压缩线遮蔽；显式配置优先（`coreOverrides.nudge` 同名键优先级更高，见下）（运行时热调：`/acp config`） |
-| `preset` | — | （可选）一句话选择 nudge 的激进程度：`preserve` / `relaxed` / `balanced` / `efficient` / `aggressive`（详见下文「预设」）。只填充你**未显式设置**的三个 nudge 阈值，优先级 显式值 > `preset` > engine 默认；未知名称在构造期报错，与显式阈值合并后若窗口反向（`min` / `max` / `emergency` 顺序错误）同样在构造期报错。不影响其他键（`modelContextLimit` / `autoNudge` / `prompts` / `coreOverrides`） （组合行专用：`preset` 尚未接入 `/acp config`，见 issue #75 后续） |
+| `preset` | — | （可选）一句话选择 nudge 的激进程度：`preserve` / `relaxed` / `balanced` / `efficient` / `aggressive`（详见下文「预设」）。只填充你**未显式设置**的三个 nudge 阈值，优先级 显式值 > `preset` > engine 默认；未知名称在构造期报错，与显式阈值合并后若窗口反向（`min` / `max` / `emergency` 顺序错误）同样在构造期报错。不影响其他键（`modelContextLimit` / `autoNudge` / `prompts` / `coreOverrides`） （组合行专用：`preset` 刻意不进热调 schema——换档须改组合行并重启生效） |
 | `coreOverrides` | — | 任何其他 acp-kernel `Config` 覆盖（billion-context-pi 的 `coreOverrides` 逃生口）。合并顺序：内核默认 → 顶层 pct 配置 → `coreOverrides.nudge` 最后落地——同名键以它为准（只读：组合行专用，不经 settings 层） |
 | `autoTools` | `true` | 在 `ctx.tools` 注册四个模型工具 |
 | `autoCommand` | `true` | 在 `ctx.commands` 注册 `/acp` 命令 |
 | `autoNudge` | `true` | 当内核建议时向 `agent/pre-step` 注入 nudge（运行时热调：`/acp config`） |
-| `settingsEnabled` | `true`（未配置即启用） | （可选）整体关闭运行时设置集成（组合行专用，不进 settings 层——开关不能关掉自己；关闭后组合行 `config:` 仍是唯一生效通道） |
+| `settingsEnabled` | `true`（未配置即启用） | （可选）关闭 `/acp config` 命令面（组合行专用，不在热调 schema 里——开关不能关掉自己；宿主从 `static Config` 生成的设置表单页不受它影响，关闭后组合行 `config:` 仍是旋钮的起点） |
 | `prompts` | — | （可选）自定义提示词文案：nudge / 范围表 / system prompt / 工具描述按槽位覆盖（模板 + 命名占位符，构造期校验；见上文「自定义提示词文案」与 [docs/configurable-prompts-design.md](docs/configurable-prompts-design.md)） |
 
 ## 预设（preset）
@@ -266,7 +264,7 @@ DSH 的每个模型请求都派生自其 append-only 会话日志（*surface*）
 - **不碰其他旋钮**：`modelContextLimit`、`autoNudge`、`prompts`、`coreOverrides` 完全不受影响；`coreOverrides.nudge` 仍最后落地、同名键最高优先。
 - **查看当前档位**：`/acp status` 会打印生效的 `preset` 及其**真实生效的**三个阈值——这一行镜像 `kernelConfigFor` 的合并顺序，所以你在其上做的显式覆盖、以及 `coreOverrides.nudge` 里的同名键都会如实显示。
 - **拼错即报错**：未知名称在引擎构造期直接抛错并列出合法值（与自定义提示词模板同一约定），不会静默回退默认。注意 bundle 行本身不带 `config`，`preset` 只能由你自己的同 id `compaction-acp` 行提供；该行构造失败即挂载失败，profile 会在你修好配置前一直起不来（fail-fast 的既定行为）。
-- **运行时热切换**：预设目前走组合配置（安装 / `cordis.patch.yml`）；待 #75 的 settings.yaml 热加载落地后，可在 `/acp config` 里改。本 PR 先让它在组合层可用。
+- **运行时热切换**：预设走组合配置（安装 / `cordis.patch.yml`）；`preset` 刻意不在热调 schema 里（一次换掉整套阈值组合，重启生效更稳妥），六个标量旋钮仍可经 `/acp config` 或宿主设置页热调。
 - **反向窗口直接报错**：与显式阈值合并后若出现 `min > max`、`max > emergency` 或 `min > emergency`（例如 `preset: 'preserve'` 配 `nudgeMaxContextLimitPct: 0.5`），引擎在构造期抛错并列出三个值。内核对这种配置只打警告、不会拒绝，所以这道校验由引擎在 `resolveAcpConfig` 里补上。
 - **与宿主 80% 线赛跑的是 `max`**：反复触发的过限提醒（`OVER-LIMIT`）由 `max` 决定；`preserve` / `relaxed` 的 emergency（0.93 / 0.90）高于宿主 compaction-basic 的 80% 线，只是超过它之后的标签升级，宿主先压缩时不会到达。
 - **`min` 是首见提醒与 T2/T3 块数触发的地板**：内核 0.0.63 在运行时读它两处——① `firstSightMassReady`（从未提醒过、还没有基线、用量 ≥ `min` 且待压内容达到增长下限时立刻提醒一次，理由串带 `[first-sight mass]`）；② `tierCountUsageFloor`（T2/T3 的「块数达标」触发同样要求用量 ≥ `min`）。常规 T1 增长提醒不看 `min`（由 `max` 与 `growthRatio` 决定），所以五档之间的主要差异仍来自 `max` 与 `emergency`，但更低的 `min` 会让首见提醒来得更早。
@@ -298,8 +296,12 @@ src/
 ├── tools.ts        # M3: compress / decompress / search_context / acp_status
 ├── nudge.ts        # M4: 内核压力决策 → 注入的建议式 nudge
 ├── system-prompt.ts# M4: 一次性 ACP 指引段（让 nudge 保持简短）
+├── prompts.ts      # M4: 可配置提示词模板 + 渲染/校验（config.prompts）
+├── presets.ts      # 预设档位（config.preset）：五档解析进 nudge 阈值旋钮
 ├── config.ts       # 内核配置组装（阈值 + coreOverrides）
+├── host-tokens.ts  # 影子价格计价：宿主 token 词汇镜像 + token-meter 读数优先（对拍宿主真实估算器）
 ├── window.ts       # 自动上下文窗口探测（宿主投影优先，LLM 运行时探测回退，兜底 128000）+ 输出预留探测（defaultMaxTokens，windowFor 内扣除）
+├── settings.ts     # M6: 运行时设置（0.2.0 SettingsForms：`static Config` schema + live 旋钮，revision 保护的 `/acp config` 写入）
 └── commands.ts     # M4: /acp 斜杠命令
 ```
 

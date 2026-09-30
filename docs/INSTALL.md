@@ -11,7 +11,7 @@ mkdir -p ~/.dsh/profiles/web/node_modules
 ln -s /Users/yintianan/GitHub/billion-context-dsh ~/.dsh/profiles/web/node_modules/billion-context-dsh
 ```
 
-依赖说明：`dist/index.js` 内联了 acp-kernel，运行时把五个 seam 包 `@deepseek-ai/dsh-compaction`、`@deepseek-ai/dsh-session`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-settings` 作为**外部依赖**（由 `devDependencies` 提供并同时声明为 `peerDependencies`，`billion-context-dsh/node_modules` 已在解析链上）；`@deepseek-ai/cordis` 与 `@deepseek-ai/schemastery` 同为 peer。这五个 seam 包共享同一个 **peer 范围** `>=0.1.5-alpha.1 <0.1.6-0`——恰好是整条 `0.1.5` 线（所有预发布加最终 `0.1.5`）。从 `0.1.5` 线起，会话 replace 操作的协议字段由 `{ op, start, end }` 改名为 `{ op, startSeq, endSeq }` 且校验严格（只接受这三个字段）；本引擎只输出新形态，在更旧的 DSH（< 0.1.5）上每次 compress 都会被宿主在运行时拒绝（issue #136），因此旧版本不在兼容范围内——请先升级 DSH 再安装。显式区间（而非 caret）是有意为之：caret 会悄悄放进未经验证的 0.1.6+ 线。五个包一并声明为 peer（而非只声明 `dsh-compaction`），是为了让安装在 pnpm 的集成/封存布局下仍能把它们解析到**宿主自己的副本**，而不是某个与宿主不一致的陈旧嵌套副本。
+依赖说明：`dist/index.js` 内联了 acp-kernel，运行时把五个 seam 包 `@deepseek-ai/dsh-compaction`、`@deepseek-ai/dsh-session`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-settings` 作为**外部依赖**（由 `devDependencies` 提供并同时声明为 `peerDependencies`，`billion-context-dsh/node_modules` 已在解析链上）；`@deepseek-ai/cordis` 与 `@deepseek-ai/schemastery` 同为 peer。这五个 seam 包共享同一个 **peer 范围** `>=0.2.0-rc.1 <0.2.1-0`——恰好是整条 `0.2.0` 线（所有预发布加最终 `0.2.0`）。基线从 0.1.5 上移到 0.2.0 是一次**破坏性接缝变更**：tool/result 角色重构（`role: 'tool'` 且 `toolCallId`/`isError`/`content` 移到消息顶层）、compaction checkpoint 标记改为 `kind: 'compact-checkpoint'`、settings 接缝换成 SettingsForms 模型（插件声明 `static Config` schema，宿主生成设置表单）；replace 方言沿用 0.1.5 起的 `{ op, startSeq, endSeq }`（更早是 `{ op, start, end }`，issue #136）。本引擎只输出 0.2.0 形态（旧 0.1.x 形状仅作历史日志回读兜底），在更旧的 DSH 上无法运行——请先升级 DSH 再安装。显式区间（而非 caret）是有意为之：caret 会悄悄放进未经验证的 0.2.1+ 线。五个包一并声明为 peer（而非只声明 `dsh-compaction`），是为了让安装在 pnpm 的集成/封存布局下仍能把它们解析到**宿主自己的副本**，而不是某个与宿主不一致的陈旧嵌套副本。
 
 ### 方式 B：打包安装（发布前验证）
 
@@ -45,9 +45,9 @@ dsh plugin --profile web add billion-context-dsh
 / `prompts` / nudge 阈值）时，在 profile 的 `cordis.patch.yml` 里写一个**同 id**
 （`compaction-acp`）的行并附 `config:` 即可覆盖 bundle 默认行（见 §2 的例子）。
 六个标量键（`modelContextLimit` / `autoModelContextLimit` / nudge 三阈值 / `autoNudge`）
-还可以**运行时热调**：编辑 `~/.dsh/settings.yaml` 的 `compaction-acp` 段或用 `/acp config`
-子命令，改动立即生效、无需重启（`settingsEnabled: false` 可整体关闭该集成——见 README
-「运行时设置」）。
+还可以**运行时热调**：在 DSH 设置界面（宿主从插件 schema 自动生成的表单页）改值，或用
+`/acp config` 子命令，改动立即生效、无需重启（`settingsEnabled: false` 只关闭 `/acp config`
+命令面——见 README「运行时设置」）。
 
 ### 方式 D：git 源安装（`github:` 规格，商店条目展示的形态）
 
@@ -56,7 +56,7 @@ dsh plugin --profile web add billion-context-dsh
 不受影响：
 
 ```bash
-dsh plugin --profile web add github:Tyan66666/billion-context-dsh#v0.2.19
+dsh plugin --profile web add github:Tyan66666/billion-context-dsh#v0.2.21
 ```
 
 建议带 `#<tag>`，拿到与对应 npm 版本完全一致的产物；不带 ref 则装默认分支的最新构建。

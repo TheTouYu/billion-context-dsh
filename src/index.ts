@@ -37,7 +37,7 @@ import {
 } from '@deepseek-ai/dsh-compaction'
 import { createCore, setDocCacheCap, type CompressionCore } from 'acp-kernel'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { SettingsService } from './settings.ts'
+import type { SettingsForms } from '@deepseek-ai/dsh-settings'
 import { DEFAULT_SESSION_CACHE_LIMIT, LruMap } from './lru.ts'
 import { AcpStateStore } from './state.ts'
 import { makeTools, type ToolEnvironment } from './tools.ts'
@@ -47,15 +47,22 @@ import { ACP_SYSTEM_PROMPT_ORDER } from './system-prompt.ts'
 import { renderSystemPrompt, resolvePrompts, type AcpPrompts, type ResolvedPrompts } from './prompts.ts'
 import { DEFAULT_CONTEXT_WINDOW, probeModelWindow, projectedContextWindow, routeFor, type AcpWindow } from './window.ts'
 import { deferCompressPairHide, stripOrphanedSurfaceToolMessages } from './region.ts'
+import { toolCallIdOfResultEvent } from './messages.ts'
 import {
   ACP_SETTINGS_NAMESPACE,
   AcpSettingsSchema,
+  acpSettingsEqual,
   describeSettingsChange,
-  filterSettingsEntry,
   makeSettingsCommandSurface,
+  normalizeSettingsRefs,
+  readSettingsRefs,
   resolveAcpSettings,
   type AcpSettings,
+  type AcpSettingsInput,
+  type AcpSettingsInputs,
+  type AcpSettingsRefs,
   type SettingsCommandSurface,
+  type SettingsKey,
 } from './settings.ts'
 import { PRESETS, PRESET_NAMES, isPresetName, resolvePreset, type NudgePreset, type PresetName } from './presets.ts'
 
@@ -117,18 +124,24 @@ export { eventsToCoreMessages, projectEvent, surfaceEventsOf, extractEventText }
 export {
   ACP_SETTINGS_NAMESPACE,
   AcpSettingsSchema,
+  acpSettingsEqual,
   describeSettingsChange,
-  filterSettingsEntry,
+  findAcpSettingsDescriptor,
   makeSettingsCommandSurface,
+  normalizeSettingsRefs,
   parseSettingValue,
+  readSettingsRefs,
   resolveAcpSettings,
   SETTINGS_KEYS,
   SETTING_DEFAULTS,
   type AcpSettings,
   type AcpSettingsInput,
+  type AcpSettingsInputs,
+  type AcpSettingsRefs,
   type SettingsChangeEffect,
   type SettingsCommandSurface,
   type SettingsKey,
+  type SettingsRef,
 } from './settings.ts'
 
 export interface AcpConfig {
@@ -287,11 +300,34 @@ function assertNudgeThresholdOrder(config: AcpConfig): void {
 }
 
 /**
+ * The engine's plugin-config shape as cordis hands it to the constructor:
+ * every ordinary `AcpConfig` key plus the six settings knobs in ref-or-scalar
+ * form (`static Config` parses the knobs into `Volatile` references; direct
+ * construction may pass plain scalars). `Partial<AcpConfig>` remains
+ * assignable to this, so existing callers and tests typecheck unchanged.
+ */
+export type AcpPluginConfig = Partial<Omit<AcpConfig, SettingsKey>> & AcpSettingsInputs
+
+/**
  * The ACP compaction backend. Subclasses the seam exactly like
  * `dsh-compaction-basic`; swaps summarization-driven compaction for
  * model-driven block compression without touching the agent loop.
  */
 export class AcpCompactionEngine extends CompactionEngine {
+  /**
+   * The plugin's cordis Config — exactly the six settings knobs, declared
+   * `volatile()` so a profile form edit (or `/acp config set`) applies to
+   * RUNNING sessions without a plugin remount: the engine keeps the live
+   * `Volatile` references and reads them on every use, never a
+   * construction-time snapshot. Ordinary keys (`prompts`, `coreOverrides`,
+   * `countTokens`, `preset`, the `auto*` registration switches, the
+   * `settingsEnabled` kill switch) are deliberately NOT declared: the loose
+   * object passes them through untouched, they stay construction-time, and
+   * the generated settings form shows exactly the volatile surface —
+   * object and function values must never reach a profile-editable form.
+   */
+  static Config = AcpSettingsSchema
+
   /** The framework-agnostic ACP compression core, reused verbatim. */
   readonly kernel: CompressionCore
   /** Per-session kernel state. */
@@ -316,17 +352,32 @@ export class AcpCompactionEngine extends CompactionEngine {
   private readonly compressCallIdsToHide = new Set<string>()
   /** Per provider/model route the resolved window (probe failures cached too). */
   private readonly windowCache = new Map<string, AcpWindow>()
-  /** Live settings snapshot thunk (composition → user settings layer); swapped when the settings provider attaches (SettingsProvider.installSection). */
-  private readSettingsSource: () => AcpSettings = () => resolveAcpSettings({})
-  /** The settings service, captured lazily for /acp config (undefined in provider-less processes). */
-  private settingsService: SettingsService | undefined
+  /** Live handles for the six settings knobs — cordis Volatile refs, or constants when constructed with scalars. */
+  private readonly settingsRefs: AcpSettingsRefs
+  /** The last snapshot readSettingsSource() returned — the diff-on-read baseline (undefined until the first read). */
+  private lastSettings: AcpSettings | undefined
   /** /acp config read/write surface. */
   readonly settingsCommand: SettingsCommandSurface
   /** Per route the adapter's per-request output cap (the output reservation); null = undisclosed. */
   private readonly outputReservationCache = new Map<string, number | null>()
-  constructor(ctx: Context, config: Partial<AcpConfig> = {}) {
+  constructor(ctx: Context, config: AcpPluginConfig = {}) {
     super(ctx)
-    this.config = resolveAcpConfig(config)
+    // Normalize the six knobs into live refs FIRST: a cordis-mounted row
+    // arrives with Volatile references (schema-parsed), direct construction
+    // with scalars — one live-read path for both. The construction-time
+    // snapshot below flattens the refs ONCE so resolveAcpConfig never sees a
+    // ref object where AcpConfig types a scalar.
+    this.settingsRefs = normalizeSettingsRefs(config)
+    const knobs = readSettingsRefs(this.settingsRefs)
+    this.config = resolveAcpConfig({
+      ...config,
+      modelContextLimit: knobs.modelContextLimit,
+      autoModelContextLimit: knobs.autoModelContextLimit,
+      nudgeMinContextLimitPct: knobs.nudgeMinContextLimitPct,
+      nudgeMaxContextLimitPct: knobs.nudgeMaxContextLimitPct,
+      nudgeEmergencyThresholdPct: knobs.nudgeEmergencyThresholdPct,
+      autoNudge: knobs.autoNudge,
+    })
     // Resolve + validate prompt templates BEFORE building env: a template typo
     // must fail engine construction, never silently leak into model context.
     this.prompts = resolvePrompts(config.prompts)
@@ -347,95 +398,32 @@ export class AcpCompactionEngine extends CompactionEngine {
     setDocCacheCap(128 * 1024 * 1024)
     this.store = new AcpStateStore()
 
-    // ── Runtime settings seam (M6) ──────────────────────────────────────
-    // The six settings-exposed knobs resolve as: schema default → composition
-    // row subset (FILTERED — a raw row also carries prompts/coreOverrides/
-    // countTokens, values that must never enter the settings layer) → the
-    // user's settings.yaml section. `current` is the live snapshot every
-    // consumer reads; `applySettings` lands an incoming change (initial call
-    // included) and runs the diff handler. The integration is an
-    // OPTIONAL-service consumer: with no settings provider (plain npm-install
-    // compositions) nothing registers and the engine behaves exactly as
-    // composed — the same values, read through the same thunk.
-    // The BASE layer the seam registers is the composition row's own scalar
-    // subset, taken from the RAW row — not from `this.config`, which already has
-    // engine defaults merged in; using it would turn every uncomposed key into a
-    // `base` override that shadows the schema default (so /acp config list would
-    // report `base` for keys nobody composed, and a reset would keep the value).
-    // `current` is the resolved snapshot reads start from; the two differ only
-    // in which keys are PRESENT, never in the values they resolve to.
-    const compositionEntry = filterSettingsEntry(config)
-    let current: AcpSettings = resolveAcpSettings(compositionEntry)
-    this.readSettingsSource = () => current
+    // ── Runtime settings (M6, the 0.2.0 model) ─────────────────────────
+    // `static Config` declares the six knobs as volatile fields, so the host
+    // projects them into a live settings form keyed by this entry's id
+    // (`compaction-acp` — the composition row id, which is also where a
+    // pre-0.2 settings.yaml section of the same name auto-imports on first
+    // boot). Nothing registers anywhere: the values ARE plugin config, the
+    // engine reads them through the live refs (readSettingsSource below), and
+    // `/acp config` talks to whatever `ctx.settings` service the process
+    // mounts — lazily, per call, so a provider-less process (plain
+    // npm-install compositions, the e2e harness) degrades to advice instead
+    // of holding a dead service handle. The old line's attach/detach dance
+    // existed to swap a source thunk around the provider lifecycle; with the
+    // refs the source cannot go stale.
+    this.settingsCommand = makeSettingsCommandSurface(
+      () => this.getSettingsService(),
+      () => this.readSettingsSource(),
+    )
     const engine = this
-    const applySettings = (): void => {
-      const next = this.readSettingsSource()
-      const prev = current
-      current = next
-      try {
-        engine.onSettingsChanged(prev, next)
-      } catch (error) {
-        // The watcher callback runs inside the settings commit loop; a sync
-        // throw must not escape into it (the loop logs and continues, but our
-        // diff handler owns its failures — warn and keep the last good).
-        this.ctx.logger.warn(`billion-context-dsh: applying settings change failed: ${String(error)}`)
-      }
-    }
-    this.settingsCommand = makeSettingsCommandSurface(() => this.settingsService, () => current)
-    if (this.config.settingsEnabled !== false) {
-      // The seam's consumer entry point is `SettingsProvider.installSection` —
-      // a METHOD on the provider as of the 0.1.5 line (the standalone
-      // `installSettingsSection` helper this was written against is gone).
-      // It registers the composition-row subset as the base layer while a
-      // provider is attached and swaps the source thunk when the provider
-      // mounts. The detach side is OURS (the disposer below): once the provider
-      // is gone the seam hands no source back, so without it the engine would
-      // keep reading the last published value and later settings.yaml edits
-      // would silently stop applying.
-      ctx.inject(['settings'], (settingsCtx) => {
-        // 0.1.7 removed the namespace seam: the service is `SettingsForms` there and has
-        // no `installSection`, because a plugin's own Config *is* its settings. The row's
-        // config already supplies every value — the same source this engine reads whenever
-        // no provider is attached — so skip registration and keep the live service for
-        // `/acp config`. Guarded at runtime so one source deploys on both lines.
-        if (typeof (settingsCtx.settings as unknown as { installSection?: unknown }).installSection !== 'function') {
-          this.settingsService = settingsCtx.settings
-          return () => {
-            this.settingsService = undefined
-          }
-        }
-        settingsCtx.settings.installSection(ctx, ACP_SETTINGS_NAMESPACE, AcpSettingsSchema, compositionEntry, {
-          // The seam's source type follows the entry it registered, so `source`
-          // is a partial view of the settings; re-resolve it into a
-          // fully-defaulted snapshot so every reader sees the same shape the
-          // composition path produced.
-          setSource: (source) => {
-            this.readSettingsSource = () => resolveAcpSettings(source())
-          },
-          onChange: applySettings,
-        })
-        // installSection hands out no service handle, and /acp config needs
-        // describe/update/replace — capture the service from the same optional
-        // inject (fires only while a provider exists; a no-op otherwise).
-        this.settingsService = settingsCtx.settings
-        // Detach cleanup: cordis disposes the value an inject callback returns
-        // when the provider fiber unloads. Without it the engine would keep a
-        // dead provider handle (/acp config would still report available and
-        // write into a disposed service) and freeze reads at the last value.
-        return () => {
-          this.settingsService = undefined
-          this.readSettingsSource = () => current
-        }
-      })
-    }
 
     const env: ToolEnvironment = {
       kernel: this.kernel,
       store: this.store,
-      // The settings-exposed knobs read LIVE from the settings source, so a
-      // settings.yaml edit (or /acp config set) hot-applies to every
-      // subsequent call — consumers never see stale numbers. (ToolEnvironment
-      // fields are readonly properties; getters satisfy them.)
+      // The settings-exposed knobs read LIVE from the volatile refs, so a
+      // settings form edit (or /acp config set) hot-applies to every
+      // subsequent call — consumers never see stale numbers.
+      // (ToolEnvironment fields are readonly properties; getters satisfy them.)
       get modelContextLimit() { return engine.readSettingsSource().modelContextLimit ?? DEFAULT_CONTEXT_WINDOW },
       get nudgeMinContextLimitPct() { return engine.readSettingsSource().nudgeMinContextLimitPct },
       get nudgeMaxContextLimitPct() { return engine.readSettingsSource().nudgeMaxContextLimitPct },
@@ -499,10 +487,11 @@ export class AcpCompactionEngine extends CompactionEngine {
     // reject that request with HTTP 400 (issue #18).
     ctx.on('session/event', (session, event) => {
       if (event.type !== 'tool/result') return
-      const message = event.data.message
-      const block = message.content[0]
-      const callId = block?.toolCallId ?? message.source.callId
-      if (typeof callId !== 'string' || !this.compressCallIdsToHide.has(callId)) return
+      // Shared extractor (top-level `toolCallId` on this line, legacy nested
+      // block / source fallbacks for old resumed rows) — the same identity
+      // read the pairing and projection use, never a local copy.
+      const callId = toolCallIdOfResultEvent(event)
+      if (callId === null || !this.compressCallIdsToHide.has(callId)) return
       this.compressCallIdsToHide.delete(callId)
       // session.append is NOT reentrant: calling it synchronously inside this
       // session/event dispatch (the outer append still holds the reentry lock)
@@ -655,13 +644,74 @@ export class AcpCompactionEngine extends CompactionEngine {
   }
 
   /**
+   * The LIVE settings snapshot — the one read path every consumer shares.
+   *
+   * Each knob is read through its volatile reference, so a settings form
+   * edit (or `/acp config set`) lands here without a restart. The composed
+   * `preset` fills the thresholds nobody set explicitly: precedence is
+   * explicit value > preset > engine default, and reading the preset from
+   * `this.config` (an ordinary, construction-time key) keeps the fill stable
+   * while the threshold refs stay live.
+   *
+   * Change detection is DIFF-ON-READ instead of the old line's onChange
+   * callback: the diff handler must run before a consumer acts on the new
+   * value, and every acting consumer (windowFor, the pre-step nudge gate)
+   * starts by reading this method — so `windowCache.clear()` fires ahead of
+   * windowFor's own cache lookup by construction, and no provider lifecycle
+   * exists to miss. Unchanged reads fire nothing.
+   */
+  private readSettingsSource(): AcpSettings {
+    const refs = this.settingsRefs
+    const preset = this.config.preset === undefined ? undefined : resolvePreset(this.config.preset)
+    const next = resolveAcpSettings({
+      modelContextLimit: refs.modelContextLimit.get(),
+      autoModelContextLimit: refs.autoModelContextLimit.get(),
+      nudgeMinContextLimitPct: refs.nudgeMinContextLimitPct.get() ?? preset?.nudgeMinContextLimitPct,
+      nudgeMaxContextLimitPct: refs.nudgeMaxContextLimitPct.get() ?? preset?.nudgeMaxContextLimitPct,
+      nudgeEmergencyThresholdPct: refs.nudgeEmergencyThresholdPct.get() ?? preset?.nudgeEmergencyThresholdPct,
+      autoNudge: refs.autoNudge.get(),
+    })
+    const prev = this.lastSettings
+    this.lastSettings = next
+    if (prev !== undefined && !acpSettingsEqual(prev, next)) {
+      try {
+        this.onSettingsChanged(prev, next)
+      } catch (error) {
+        // A sync throw from the diff handler must not escape into whichever
+        // consumer triggered the read — warn and keep the last good effects.
+        this.ctx.logger.warn(`billion-context-dsh: applying settings change failed: ${String(error)}`)
+      }
+    }
+    return next
+  }
+
+  /**
+   * The host settings service, resolved lazily on EVERY call — no captured
+   * handle, so a service that unloads mid-process degrades `/acp config` to
+   * advice instead of writing into a disposed service (the 0.1.x line needed
+   * an inject disposer for exactly this; a per-call resolve cannot go stale).
+   *
+   * The `settingsEnabled` kill switch gates only this surface on the 0.2.0
+   * line: the settings form itself is generated from `static Config` and
+   * owned by the active profile — there is no per-plugin way to hide it
+   * (`configure({auto:false})` hides EVERY plugin's page), and the knobs
+   * remain live reads either way because they are plugin config, not
+   * settings-service state. A composition that disables the switch keeps a
+   * working engine with composition-row values and no `/acp config`.
+   */
+  private getSettingsService(): SettingsForms | undefined {
+    if (this.config.settingsEnabled === false) return undefined
+    return this.ctx.get('settings')
+  }
+
+  /**
    * Diff handler for runtime settings changes: drop the window cache when a
    * window-related key changed (probe FAILURES are cached too — clearing is
    * what lets the next pre-step re-probe after a fix), clear the per-turn
    * nudge dedup when nudges come back on, and warn on order anomalies
    * (accepted, never rejected — rejecting a write cannot fix an externally
-   * edited settings.yaml, and an invalid stored section would fail the next
-   * boot loud anyway).
+   * edited profile, and an invalid stored value would fail the next boot
+   * loud anyway).
    */
   private onSettingsChanged(prev: AcpSettings, next: AcpSettings): void {
     const effect = describeSettingsChange(prev, next)

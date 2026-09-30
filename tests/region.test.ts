@@ -20,6 +20,7 @@ import {
   shadowedSeqsOf,
   stripOrphanedSurfaceToolMessages,
 } from '../src/region.ts'
+import { checkpointCompactionIdOf, isCheckpointNode } from '../src/messages.ts'
 import { appendTurn, appendToolCall, appendToolResult, appendMultiToolCall, appendUser, appendAssistant, buildTextSession, longText, wholeSurfaceRangeView } from './helpers.ts'
 
 test('M2: AcpStateStore initialises one state per session', () => {
@@ -64,11 +65,18 @@ test('M5: runCompactionTransaction lands the four events and shadows the range',
   for (const seq of [1, 2, 3, 4]) assert.ok(!session.surface.nodes.includes(seq))
   assert.ok(session.surface.nodes.includes(seqs[2]!), 'the replacement node joins the surface')
 
-  // The summary node carries the checkpoint source.
+  // The summary node carries the checkpoint source. The host's
+  // `compactCheckpointSource` writes the 0.1.7+/0.2.0 marker shape
+  // (`{ kind: 'compact-checkpoint', compactionId }`); the legacy
+  // `plugin: 'compact'` row is still READ (durability of old logs) but no
+  // longer written.
   const replaceEvent = session.snapshotEvents()[seqs[2]!]!
   assert.equal(replaceEvent.type, 'user/message')
-  const source = (replaceEvent.data as { source?: { plugin?: string } }).source
-  assert.equal(source?.plugin, 'compact')
+  const source = (replaceEvent.data as { source?: { kind?: string; plugin?: string } }).source
+  assert.equal(source?.kind, 'compact-checkpoint')
+  assert.equal(source?.plugin, undefined)
+  assert.equal(checkpointCompactionIdOf(replaceEvent), compactionId)
+  assert.ok(isCheckpointNode(replaceEvent))
 
   // Derived messages shrank: 6 messages → 2 surviving + 1 summary = 3.
   assert.equal(session.deriveMessages().length, 3)

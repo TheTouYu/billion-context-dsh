@@ -66,20 +66,29 @@ function stringifyArgs(args: unknown): string {
 /**
  * The tool-call id of one tool/result surface message, or null.
  *
- * Real DSH tool-result events carry NO `message.toolCallId` (hard-won rule
- * 10): the identity lives in the nested `{ type: 'tool-result', toolCallId }`
- * content block, falling back to `message.source.callId`. Shared with
- * `src/region.ts`'s call/result pairing — one implementation, never a copy.
+ * On the 0.1.7+/0.2.0 shape the id is the message's TOP-LEVEL
+ * `toolCallId` (the nested `tool-result` content block no longer carries
+ * it and the message role is `tool`); the legacy fallbacks stay because
+ * sessions committed on the 0.1.5 line keep their old rows when resumed —
+ * nested-block `toolCallId` first, then `message.source.callId` (which the
+ * current line stamps on every tool/result anyway). Shared with
+ * `src/region.ts`'s call/result pairing and the engine's compress-pair
+ * hide — one implementation, never a copy (hard-won rule 10).
  */
 export function toolCallIdOfResultEvent(event: SessionEvent): string | null {
   if (event.type !== 'tool/result') return null
   const message = (event.data as {
-    message?: { content?: Array<{ type?: unknown; toolCallId?: unknown }>; source?: { callId?: unknown } }
+    message?: {
+      toolCallId?: unknown
+      content?: ReadonlyArray<{ type?: unknown; toolCallId?: unknown }>
+      source?: { callId?: unknown }
+    }
   }).message
-  const block = Array.isArray(message?.content)
+  if (message === undefined) return null
+  const block = Array.isArray(message.content)
     ? message.content.find((candidate) => candidate?.type === 'tool-result')
     : undefined
-  const id = block?.toolCallId ?? message?.source?.callId
+  const id = message.toolCallId ?? block?.toolCallId ?? message.source?.callId
   return typeof id === 'string' ? id : null
 }
 
@@ -242,11 +251,26 @@ export function extractEventText(event: SessionEvent): string {
 export function isCheckpointNode(event: SessionEvent): boolean {
   if (event.type !== 'user/message') return false
   const source = (event.data as { source?: { kind?: string; plugin?: string } }).source
-  // 0.1.7 stamps `{ kind: 'compact-checkpoint' }`; 0.1.5 stamped
-  // `{ kind: 'plugin', plugin: 'compact' }`. Both are read: sessions committed
-  // before the upgrade still carry the legacy row, and a checkpoint that stops
-  // classifying as one becomes foldable — distillation is an explicit act.
+  // 0.1.7+ stamps `{ kind: 'compact-checkpoint' }` (what
+  // `compactCheckpointSource` from dsh-compaction writes — our own checkpoint
+  // writer uses that helper); 0.1.5 stamped `{ kind: 'plugin', plugin:
+  // 'compact' }`. Both are read: sessions committed before the upgrade still
+  // carry the legacy row, and a checkpoint that stops classifying as one
+  // becomes foldable — distillation is an explicit act. Shape-level only: a
+  // node missing its compactionId is malformed but STILL a checkpoint.
   return source?.kind === 'compact-checkpoint' || source?.plugin === 'compact'
+}
+
+/**
+ * The durable compaction id a checkpoint node carries, in EITHER host shape
+ * (see {@link isCheckpointNode}). Shared by the region.ts seq/registry
+ * readers so writer and readers can never disagree on identity; returns
+ * undefined for plain messages and malformed checkpoints (no string id).
+ */
+export function checkpointCompactionIdOf(event: SessionEvent): string | undefined {
+  if (!isCheckpointNode(event)) return undefined
+  const source = (event.data as { source?: { compactionId?: unknown } }).source
+  return typeof source?.compactionId === 'string' ? source.compactionId : undefined
 }
 
 /**
@@ -304,14 +328,21 @@ export const METADATA_KINDS: ReadonlySet<string> = new Set([
  * for {@link METADATA_KINDS}, so a kind can never be authored that the
  * classifier below does not recognise as engine metadata.
  *
- * The assertion covers 0.1.5's `MessageSourceMap`, which has no member for a
- * plugin-owned kind. Both versions type `MessageSource` as
- * `MessageSourceMap[keyof MessageSourceMap]` — an OPEN interface — and both
- * pass `user/message` rows through their runtime validation, so the value is
- * legal at run time in either version; only the pre-0.1.7 type needs the cast.
+ * The kinds are declared in `MessageSourceMap` (augmentation below), so the
+ * object the host's `user/message` validation and the session format see is
+ * also the object the type system checks.
  */
 export function engineSource(kind: 'acp-nudge' | 'billion-context-dsh', form: string): MessageSource {
-  return { kind, form } as unknown as MessageSource
+  return { kind, form }
+}
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    /** Forced-nudge echo rows written by the engine (form 'nudge'). */
+    'acp-nudge': { kind: 'acp-nudge'; form: string }
+    /** Engine-authored replacement rows: the visible prune tombstone (form 'prune-tombstone'). */
+    'billion-context-dsh': { kind: 'billion-context-dsh'; form: string }
+  }
 }
 
 /**
@@ -334,20 +365,31 @@ const REAL_CONTENT_PLUGINS: ReadonlySet<string> = new Set([
 ])
 
 /**
- * The same host content rows under their 0.1.7 producer-owned kinds. The
- * upgrade renamed every one of them, so keying only on the legacy names would
- * misfile each as an unknown policy row — snapshot rows would stop folding and
- * the protection window would refuse them for the wrong reason.
+ * The same host content rows under their producer-owned kinds (0.1.7+/0.2.0).
+ * The upgrade renamed every one of them, so keying only on the legacy names
+ * would misfile each as an unknown policy row — snapshot rows would stop
+ * folding and the protection window would refuse them for the wrong reason.
  * Names come from the format's own migration tables (`RENAMED_PRODUCERS` for
- * the three that changed, `RELEASED_SAME_NAME_PRODUCERS` for the rest).
- *  - 'runtime-context' — was '@deepseek-ai/dsh-system-prompt'
- *  - 'ptc-mode' — was 'tools-ptc' / 'tools-code-mode'
- *  - 'user-approval' — unchanged name, new kind
+ * the three that changed, `RELEASED_SAME_NAME_PRODUCERS` for the rest) plus
+ * the 0.2.0 seam's own `MessageSourceMap` augmentations:
+ *  - 'runtime-context' — was '@deepseek-ai/dsh-system-prompt' (dsh-agent-loop;
+ *    time/tmux sections ride inside these snapshots as `form:'snapshot'`
+ *    sections, not as separate kinds)
+ *  - 'ptc-mode' — was 'tools-ptc' / 'tools-code-mode' (dsh-tools, deferred
+ *    images)
+ *  - 'user-approval' — unchanged name, new kind (dsh-user-approval)
+ *  - 'model-selection' — model switch notices (dsh-agent): event-driven
+ *    appends, never presence-reinjected, so folding reclaims tokens with no
+ *    re-inject loop (issue #71's danger class is unconditional re-injection)
+ *  - 'tool-registry' — tool availability changes (dsh-tools): same
+ *    event-driven nature as model-selection
  */
 const REAL_CONTENT_KINDS: ReadonlySet<string> = new Set([
   'runtime-context',
   'ptc-mode',
   'user-approval',
+  'model-selection',
+  'tool-registry',
 ])
 
 /** Known host policy kinds that must never be folded (safe-listing beyond `plugin`). */
@@ -411,11 +453,18 @@ export function classifySurfaceEvent(event: SessionEvent): SurfaceEventClass {
 export function isRealUserTurn(event: SessionEvent): boolean {
   if (event.type !== 'user/message') return false
   if (classifySurfaceEvent(event) !== 'real') return false
-  const source = (event.data as { source?: { kind?: string; plugin?: string } }).source
-  // Host content rows that are NOT the user speaking (dynamic-context snapshot,
-  // approval notice, deferred tool context): foldable, but they must never win
-  // the protection window — that is exactly the bug class issue #71 fixes.
-  if (source?.plugin !== undefined && REAL_CONTENT_PLUGINS.has(source.plugin)) return false
-  if (source?.kind !== undefined && REAL_CONTENT_KINDS.has(source.kind)) return false
-  return source?.kind !== 'subagent-report' && source?.kind !== 'subagent-settled'
+  const source = (event.data as { source?: { kind?: string } }).source
+  // A user turn written without a source is genuine content (the host's own
+  // bare-append path) and can be the protected turn.
+  if (source === undefined) return true
+  // Only the host's `user` kind is the human speaking. Every producer-owned
+  // row — the foldable content kinds above (runtime-context snapshot,
+  // ptc-mode, user-approval, model-selection, tool-registry, legacy plugin
+  // names), the sub-agent relay kinds (`coordinator`, `subagent-report`,
+  // `subagent-settled`, `team-message`), and ANY future kind the host adds —
+  // is foldable content but never the user's words, so none of them may win
+  // the protection window (issue #71's bug class). The old shape special-cased
+  // the relay kinds at the tail; keying positively on `kind === 'user'`
+  // subsumes that and keeps future kinds on the safe side by construction.
+  return source.kind === 'user'
 }

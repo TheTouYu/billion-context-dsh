@@ -1,16 +1,16 @@
-# 运行时设置集成设计（Settings Integration Design）— v2
+# 运行时设置集成设计（Settings Integration Design）— v4
 
 > **目标**：让 `AcpConfig` 中适合运行时调整的数值项（上下文窗口、nudge 阈值、自动开关）接入宿主
-> `ctx.settings` 设置体系——用户改 `~/.dsh/settings.yaml` 即热生效，无需重启；并提供 `/acp config`
-> 斜杠命令在任意模式（TUI/web/headless）读写同一份配置。
+> 0.2.0 的 SettingsForms 设置体系——插件声明 `static Config` schema，宿主自动生成设置表单页，
+> 改值即热生效、无需重启；并提供 `/acp config` 斜杠命令在任意模式（TUI/web/headless）读写同一份配置。
 >
 > **范围声明**：本文档只覆盖**阶段一（宿主侧设置接缝）+ 阶段一b（`/acp config` 子命令）**。
-> 浏览器端设置卡片是阶段三：rc.6 时代被宿主 `WEB_SETTINGS_NAMESPACES` 白名单硬编码阻塞；
-> **2026-09-06 勘探确认 0.1.2 线上门禁已解除**（见 §5「浏览器设置卡片·勘探更新」），
-> 剩余工作是自建 client 卡片/页（需按 0.1.2 客户端重勘后设计）。
+> 浏览器端设置卡片是阶段三：0.2.0 起宿主**直接从 `static Config` 自动生成插件设置页**，
+> 阶段三的自建 client 卡片需求已随之消失（表单页由宿主拥有，插件无法也无需自绘）。
 >
-> **评审状态**：已经过三路独立评审（宿主接缝合规 / 引擎架构与回归风险 / 对抗性边界），
-> 全部阻断项已修复，判定均为「修改后通过」。v2 修订明细见文末修订记录。
+> **评审状态**：v2 定稿已经过三路独立评审（宿主接缝合规 / 引擎架构与回归风险 / 对抗性边界），
+> 全部阻断项已修复，判定均为「修改后通过」。v3 把接缝对齐到 0.1.5 线；**v4 是 0.2.0 的
+> SettingsForms 重设计**（接缝整体替换，见 §1 与修订记录）。
 
 ---
 
@@ -22,13 +22,39 @@
 1. **改一个阈值要重启**。`cordis.patch.yml` 是启动时读一次的组合层，长会话中途想调低
    `nudgeMaxContextLimitPct`、或给某个网关补一个探测不到的 `modelContextLimit`，只能重启进程，
    会话现场（窗口缓存、nudge 去重状态）全部丢失。
-2. **没有统一入口**。宿主已有完整的用户设置层（`~/.dsh/settings.yaml`，分 namespace 分层解析、
-   热重载、写校验），bash 预算、agent-loop 并行度等都已接入。我们不接入，用户就要学两套配置心智。
+2. **没有统一入口**。宿主已有完整的用户设置层（0.2.0：profile 驱动的设置表单体系，
+   分层解析、热生效、写校验），bash 预算、agent-loop 并行度等都已接入。我们不接入，用户就要学
+   两套配置心智——而在 0.2.0 接缝上「接入」只需要声明 schema：宿主自动生成表单页，
+   我们要做的全部工作是让引擎真正热读这些值（本设计的主题）。
 
-宿主侧机制调查结论（2026-07，逐条对着安装版 dsh 0.1.0-rc.6 的 `lib/` 源码验证过；
-2026-09 已按本仓库 devDep 的 0.1.5 线（`0.1.5-rc.2`）重新核验——接缝 API 在该线发生破坏性变更，见下）：
+宿主侧机制调查结论（2026-07 起，逐条对着安装版源码验证过；**v4：0.2.0 线整体替换了接缝，现行形态如下，0.1.x 形态全部降级为历史留档**）：
 
-- **接缝（0.1.5 现状，PR #130 已按此接线）**：官方可选消费者接线是 provider 上的**方法**
+- **接缝（0.2.0 现状，v4 已按此接线）**：宿主从**插件配置 schema** 投影设置——插件在类上声明
+  `static Config`（字段带 `volatile()`），活动 profile 的组合条目携带取值，`ctx.get('settings')`
+  返回的 `SettingsForms` 服务把它们呈现为可热编辑的表单（编辑写进 profile 覆盖层）。
+  关键事实：
+  - **schema 即唯一面**：profile 校验器、生成的设置页、`/acp config` 读的是同一个
+    `static Config` 对象（引擎侧引用 `AcpSettingsSchema`），三面永不漂移；0.1.x 时代
+    「我们自己注册 base 层」的陷阱在这个接缝上结构性不存在。
+  - **`volatile()` 字段解析成 `Volatile<T>` 引用**：cordis 把引用交给构造器，引擎持有引用、
+    每次使用时读取——热改不需要插件重挂载。schema 的宽松对象对未声明的键原样透传，
+    所以 `prompts` / `coreOverrides` / `preset` / `auto*` 开关等**非 volatile 键**仍是
+    构造期普通配置（`AcpPluginConfig = Partial<Omit<AcpConfig, SettingsKey>> & AcpSettingsInputs`），
+    且永远不会出现在表单里——对象/函数值不得进 profile 可编辑表单。
+  - **服务 API（`SettingsForms`）**：`describe(options?) → SettingsDescriptor[]`（带 base 层、
+    原始 user 层与 `revision`）、`update(ns, patch, expectedRevision?)`、
+    `replace(ns, section, expectedRevision?)`、`mutate`、`configure({auto})`、`writable`、
+    `documentPath`、`prepareDocument()`。descriptor 的 `ns` 带编译期 brand，普通字面量比较
+    须走 `String(descriptor.ns)`。过期 revision 的写抛 `SettingsConflictError`
+    （code `SETTINGS_CONFLICT`）。
+  - **服务缺席即 `undefined`**：`ctx.get('settings')` 在无设置服务的进程里返回 `undefined`
+    （纯 npm 安装组合），消费端按可选服务降级。
+  - **旧 settings.yaml 迁移**：0.1.x 的 `~/.dsh/settings.yaml` `compaction-acp:` 段由宿主在
+    首次启动时自动导入组合条目，无需插件或用户手工迁移。
+  - **变更通知**：没有 0.1.x 的 `scope.watch`/`onChange` 回调——cordis 的 `Volatile` 引用本身
+    就是通知机制（profile 写入后引用读到新值），变更检测由消费端做 **diff-on-read**
+    （§4.3/§4.4）。
+- **接缝（0.1.5 历史，v3 接线形态，已被 0.2.0 替换——保留作演变记录）**：官方可选消费者接线是 provider 上的**方法**
   `settingsProvider.installSection(ctx, ns, schema, entry, hooks)`（`lib/types/index.d.ts:228`），
   在 `ctx.inject(['settings'], (settingsCtx) => { … })` 回调内以
   `settingsCtx.settings.installSection(...)` 调用：
@@ -125,27 +151,31 @@
 
 ## 3. 方案总览
 
-新增 src/settings.ts（M6），引擎构造器接线一处；命名空间 `compaction-acp`
-（与组合行 ID 同名：用户心智 = 「settings.yaml 里这个 section 就是在改我那行 compaction-acp 的 config」）。
+新增 src/settings.ts（M6），引擎类声明 `static Config = AcpSettingsSchema`（v4：六键 volatile schema，
+同时是 profile 校验器、宿主设置页与 `/acp config` 的唯一字段面）；设置条目 id `compaction-acp`
+（与组合行 ID 同名：用户心智 = 「设置页里这个条目就是在改我那行 compaction-acp 的 config」）。
 
 ```
-解析顺序（每键独立）：  schemastery schema 默认值
-                      → base = 组合行 config 的【过滤后子集】(§4.2)
-                      → 用户层 ~/.dsh/settings.yaml 的 compaction-acp section
-写入入口：            手编 ~/.dsh/settings.yaml（provider publish 热生效）
-                      或 /acp config set|reset（service.update/replace）
-消费方式：            引擎 env 的标量字段改为活源 getter（§4.3）；onChange 清窗口缓存
+解析顺序（每键独立）：  schema 默认值（仅两个布尔；三阈值刻意无默认）
+                      → base = 继承的组合层（bundle 行 + 同 id 覆盖行的 config）
+                      → user = 活动 profile 对 compaction-acp 条目自己的覆盖层
+写入入口：            宿主设置页表单（写 profile 覆盖层）
+                      或 /acp config set|reset（service.update/replace，revision 乐观并发）
+消费方式：            引擎持有 Volatile 引用、readSettingsSource() 逐次活读（§4.3）；
+                      diff-on-read 触发清窗口缓存等副作用（§4.4）
 ```
 
-数据流（以手编 settings.yaml 为例）：
+数据流（以宿主设置页改值为例）：
 
 ```
-dsh-settings-file 监听 ~/.dsh/settings.yaml
-  → provider.publish(doc) → compaction-acp section 重新 resolve（非法则保 last-good 并告警）
-  → scope.watch 触发 hooks.onChange()
-  → 引擎：换 source thunk 已由 setSource 完成 → 清 windowCache → 日志一行
+用户在设置页改 nudgeMaxContextLimitPct → SettingsForms 校验 + 写 profile 覆盖层（revision +1）
+  → cordis 更新 compaction-acp 条目的 Volatile 引用快照（无插件重挂载）
+  → 引擎下一次 readSettingsSource() 读到新值 → 与上次快照 diff → 清 windowCache / 告警
   → 下一个 pre-step / compress 调用经 {...env} 读到新值；windowFor 显式分支即时生效
 ```
+
+（0.1.x 的 `provider.publish` → `scope.watch` → `hooks.onChange` 推送链已不存在——`Volatile` 引用
+本身就是通知机制，消费端 diff-on-read。）
 
 ## 4. 详细设计
 
@@ -154,246 +184,261 @@ dsh-settings-file 监听 ~/.dsh/settings.yaml
 ```ts
 import z from '@deepseek-ai/schemastery'
 
-// 0.1.5 线：namespace 是普通字符串字面量（`settingsNamespace()` helper 已删除），
-// 编译期 brand 由 installSection 调用点的 `Namespace & SettingsNamespaceInput<Namespace>` 施加
+// 0.2.0 起：schema 是插件类的 static Config——profile 校验器、宿主生成的设置页、
+// /acp config 读的都是这一个对象。设置条目 id 就是组合行 id（普通字符串字面量；
+// 0.1.x 的 settingsNamespace() brand helper 早已删除）。
 export const ACP_SETTINGS_NAMESPACE = 'compaction-acp'
 
-// 注意：schemastery 3.18.1 的 number 链上没有 .int() / .positive()
+// 引擎侧解析默认值（resolveAcpSettings 对缺键的兜底）。两个布尔的 schema .default()
+// 也从这一个对象构建——schema 与解析路径永不漂移。
+export const SETTING_DEFAULTS = {
+  autoModelContextLimit: true,
+  nudgeMaxContextLimitPct: 0.7,
+  nudgeEmergencyThresholdPct: 0.85,
+  autoNudge: true,
+} as const
+
+// 注意：schemastery 3.18.x 的 number 链上没有 .int() / .positive()
 // （已核验 lib/index.mjs：仅有 min/max/step/pattern；官方快捷方式
 // Schema.natural = number().step(1).min(0)）。整数约束的唯一正确写法是
 // agent-loop 同款 .step(1)，正数下界用 .min(1)。
 export const AcpSettingsSchema = z.object({
-  modelContextLimit: z.number().step(1).min(1).optional(),
-  autoModelContextLimit: z.boolean().default(true),
-  nudgeMinContextLimitPct: z.number().min(0).max(1).optional(),
-  nudgeMaxContextLimitPct: z.number().min(0).max(1).default(0.7),
-  nudgeEmergencyThresholdPct: z.number().min(0).max(1).default(0.85),
-  autoNudge: z.boolean().default(true),
+  modelContextLimit: z.number().step(1).min(1).volatile(),
+  autoModelContextLimit: z.boolean().default(SETTING_DEFAULTS.autoModelContextLimit).volatile(),
+  nudgeMinContextLimitPct: z.number().min(0).max(1).volatile(),
+  nudgeMaxContextLimitPct: z.number().min(0).max(1).volatile(),
+  nudgeEmergencyThresholdPct: z.number().min(0).max(1).volatile(),
+  autoNudge: z.boolean().default(SETTING_DEFAULTS.autoNudge).volatile(),
 })
-export type AcpSettings = z.output<typeof AcpSettingsSchema>
+export type AcpSettings = { /* 六键的 resolved 形状（src/settings.ts AcpSettings） */ }
 ```
 
 三条铁律：
 
-- **schema 默认值 == 引擎默认值**（0.70/0.85/true，来自 `DEFAULT_CONFIG`），绝不写 kernel 的
-  0.45/0.75/0.95——否则未触碰该 namespace 的部署行为就变了。`nudgeMinContextLimitPct` 与
-  `modelContextLimit` 保持 optional 无默认：缺省时分别由 kernel 自身兜底（0.45 校验下限 /
-  探测模式），单一事实来源不在我们这里，与今天一致。
-- **默认值改动必须同步三处**：`DEFAULT_CONFIG`、本 schema、README 配置表。测试锁定（§6）。
-- **边界语义以测试为准**：类型注释称 min/max 是 inclusive（含 0 与 1），但行为以运行时实测
-  为准——§6 测试计划含边界值断言（0、1、1.0000001）。
+- **引擎默认值只有一个事实来源**：`SETTING_DEFAULTS`（0.7/0.85/true，刻意低于 kernel 的
+  0.75/0.95），schema 的两个布尔 `.default()` 从它构建，`resolveAcpSettings` 的兜底也从它
+  取——绝不写 kernel 的 0.45/0.75/0.95，否则未触碰设置的部署行为就变了。
+- **三个 nudge 阈值刻意不带 schema 默认**：volatile 引用在无人组合取值时必须读出
+  `undefined`，组合层的 `preset` 档位才能填上它（显式值 > preset > 引擎默认，
+  `resolvePresetThresholds`）；schema 默认会像当年的 `DEFAULT_CONFIG` 一样把 preset 挡住。
+  表单控件对未设阈值显示空，是「继承中」的诚实展示。`modelContextLimit` 与
+  `nudgeMinContextLimitPct` 同理保持无默认（缺省 = 探测模式 / kernel 自身 0.45 下限）。
+- **默认值改动必须同步三处**：`SETTING_DEFAULTS`、schema（经它自动）、README 配置表。测试锁定（§6）。
+  另注：schemastery 的越界校验在**解析时抛错**（不是静默 clamp）——`/acp config set` 的报错文案
+  直接透出 service 的原文（§4.6）。
 
-### 4.2 base 过滤（保持 resolved 快照干净）
+### 4.2 表单字段面 = `static Config`（0.2.0；0.1.x 的 base 过滤已随之消亡）
 
-`SettingsProvider.installSection(ctx, ns, schema, entry, …)` 把 `entry` 原样作为 `base` 注册
-（0.1.0-rc.6 线为自由函数 `installSettingsSection(ctx, ns, schema, entry, …)`，行为相同）。评审核验：
-**register 并不校验 base**（dsh-settings lib/index.js:311-313 原样存入），且 schemastery 的
-object 解析器默认非 strict（lib/index.mjs:479-487 `if (!strict) merge(result, data)`）——未知键
-会**透传进 deepFreeze 后的 resolved 快照**。所以过滤的理由不是「防注册失败」，而是：
+**v4 形态**：我们不再向设置服务注册任何 base 层——`installSection` 整条路径已删除。表单里
+出现哪些字段由 `static Config = AcpSettingsSchema` **声明即定**：六个 volatile 键进表单，
+`prompts` / `coreOverrides` / `countTokens` / `preset` / `auto*` 开关不在 schema 里，所以
+**结构性不可能**出现在 profile 可编辑表单中（对象/函数值不得进表单的卫生目标由接缝本身保证，
+不再靠白名单过滤函数）。cordis 的宽松对象 schema 对未声明键原样透传，这些键以构造期普通配置
+的形式到达引擎（`AcpPluginConfig = Partial<Omit<AcpConfig, SettingsKey>> & AcpSettingsInputs`），
+行为与 0.1.x 的组合层专属语义一致。分层读取（`/acp config list` 的来源归因）：schema 默认 →
+descriptor 的 `base`（继承的组合层）→ descriptor 的 `user`（活动 profile 自己的覆盖）——按
+**键在层里的存在性**归因，不按值比较。
 
-1. **非 JSON 兼容值污染快照与 describe 路径**：组合行里的 `countTokens` 是函数、`coreOverrides`
-   可能很大；函数值一旦进入 resolved，未来任何走 `structuredClone`/JSON 化的展示路径都可能炸。
-2. **内存卫生**：无意义的大对象被冻结在每份快照里。
-3. **语义清晰**：设置层 namespace 只描述它拥有的六个键。
+**0.1.x 历史（保留）**：当时 `SettingsProvider.installSection(ctx, ns, schema, entry, …)` 把
+`entry` 原样注册为 `base`，而 register 不校验 base、schemastery object 解析器默认非 strict
+（未知键透传进 deepFreeze 后的 resolved 快照），所以引擎侧要维护一个 `filterSettingsEntry`
+白名单函数把组合行 config 过滤成六键子集再注册——快照卫生（函数值/大对象不进 resolved）。
+v4 接缝下该函数与它的三条理由（非 JSON 值污染、内存卫生、语义清晰）全部由「未声明键不进
+schema 即不进表单」替代。
 
-因此 entry 必须是**只含六个已知键的白名单子集**（类型对齐 `z.input<typeof AcpSettingsSchema>`）：
-
-```ts
-function filterSettingsEntry(config: AcpConfig): AcpSettingsInput {
-  const out: AcpSettingsInput = {}
-  if (config.modelContextLimit !== undefined) out.modelContextLimit = config.modelContextLimit
-  if (config.autoModelContextLimit !== undefined) out.autoModelContextLimit = config.autoModelContextLimit
-  if (config.nudgeMinContextLimitPct !== undefined) out.nudgeMinContextLimitPct = config.nudgeMinContextLimitPct
-  if (config.nudgeMaxContextLimitPct !== undefined) out.nudgeMaxContextLimitPct = config.nudgeMaxContextLimitPct
-  if (config.nudgeEmergencyThresholdPct !== undefined) out.nudgeEmergencyThresholdPct = config.nudgeEmergencyThresholdPct
-  if (config.autoNudge !== undefined) out.autoNudge = config.autoNudge
-  return out
-}
-```
-
-纯函数，单测直测。未列出的键继续只从 `this.config`（组合层）读取，行为不变。
-
-### 4.3 活值接线：getter 背书的 env（照抄 agent-loop 形态)
+### 4.3 活值接线：Volatile 引用 + readSettingsSource（v4；0.1.x 的 source thunk/onChange 已删除）
 
 ```ts
-// src/settings.ts
-export interface SettingsRuntimeSource { (): AcpSettings }
+// src/settings.ts —— 引用归一：cordis 解析出的 Volatile 引用原样透传，
+// 直接构造传的标量变成常量引用——测试/fake 与真实挂载共享同一条活读路径。
+export function normalizeSettingsRefs(inputs: AcpSettingsInputs): AcpSettingsRefs { … }
 
 // src/index.ts 构造器内
-const baseEntry = filterSettingsEntry(this.config)
-let source: SettingsRuntimeSource = () => ({
-  // 初始活源 = 过滤后的组合子集经引擎默认值补齐（settings 服务接管前/缺席时的等价兜底，
-  // 与服务脱离时 installSection 回落的同一个 filtered 对象同源同形）
-  ...resolveAcpConfig(baseEntry),
-})
-// 上次已应用的快照——onChange 无参回调（helper 不透传 watch 的 next/prev），前值必须自己记。
-// 直接引用构造期闭包变量当 prev 是评审抓出的悬垂 bug：它会永远停在初始值。
-let lastApplied: AcpSettings = source()
+this.settingsRefs = normalizeSettingsRefs(config)      // 六键活引用
+this.config = resolveAcpConfig(…)                       // 其余键 = 构造期普通配置
+this.lastSettings: AcpSettings | undefined = undefined  // diff-on-read 基线（首读不触发）
 
-const applySettingsChange = (): void => {
-  const next = source()
-  try {
-    this.onSettingsChanged(lastApplied, next)   // §4.4
-  } catch (error) {
-    // watcher 链只 contain 异步异常；同步抛出会冒泡进 settings 服务的 commit 循环——必须自己兜住
-    this.ctx.logger.warn('billion-context-dsh: settings change handler failed — previous behavior kept', error)
+// 唯一读路径（每个消费端共用）：
+private readSettingsSource(): AcpSettings {
+  const refs = this.settingsRefs
+  const preset = this.config.preset === undefined ? undefined : resolvePreset(this.config.preset)
+  const next = resolveAcpSettings({
+    modelContextLimit: refs.modelContextLimit.get(),
+    autoModelContextLimit: refs.autoModelContextLimit.get(),
+    // 组合层 preset 填补无人显式设置的阈值：显式值 > preset > 引擎默认。
+    // preset 是构造期普通键（不在 volatile schema 里），读 this.config 保证填充稳定。
+    nudgeMinContextLimitPct: refs.nudgeMinContextLimitPct.get() ?? preset?.nudgeMinContextLimitPct,
+    nudgeMaxContextLimitPct: refs.nudgeMaxContextLimitPct.get() ?? preset?.nudgeMaxContextLimitPct,
+    nudgeEmergencyThresholdPct: refs.nudgeEmergencyThresholdPct.get() ?? preset?.nudgeEmergencyThresholdPct,
+    autoNudge: refs.autoNudge.get(),
+  })
+  const prev = this.lastSettings
+  this.lastSettings = next
+  if (prev !== undefined && !acpSettingsEqual(prev, next)) {
+    try { this.onSettingsChanged(prev, next) }   // §4.4
+    catch (error) {
+      // diff 处理器的同步异常不得逃进触发读取的消费端——warn 并保留上次好的副作用
+      this.ctx.logger.warn(`billion-context-dsh: applying settings change failed: ${String(error)}`)
+    }
   }
-  lastApplied = next
+  return next
 }
 
 const env: ToolEnvironment = {
   kernel: this.kernel,
   store: this.store,
-  // ↓ 三个阈值 + 窗口字段改为 getter；{ ...env } 展开时当场取当前值
-  get modelContextLimit() { return source().modelContextLimit ?? DEFAULT_CONTEXT_WINDOW },
-  get nudgeMinContextLimitPct() { return source().nudgeMinContextLimitPct },
-  get nudgeMaxContextLimitPct() { return source().nudgeMaxContextLimitPct },
-  get nudgeEmergencyThresholdPct() { return source().nudgeEmergencyThresholdPct },
+  // ↓ getter 背书：{ ...env } 展开时经 readSettingsSource() 当场取当前值（含 diff 副作用）
+  get modelContextLimit() { return engine.readSettingsSource().modelContextLimit ?? DEFAULT_CONTEXT_WINDOW },
+  get nudgeMinContextLimitPct() { return engine.readSettingsSource().nudgeMinContextLimitPct },
+  get nudgeMaxContextLimitPct() { return engine.readSettingsSource().nudgeMaxContextLimitPct },
+  get nudgeEmergencyThresholdPct() { return engine.readSettingsSource().nudgeEmergencyThresholdPct },
   coreOverrides: this.config.coreOverrides,   // 组合层专属，不经设置层
-  windowFor: (agent) => this.windowFor(agent),
-  prompts: this.prompts,
-  compressCallIdsToHide: this.compressCallIdsToHide,
-}
-
-if (this.config.settingsEnabled !== false) {   // kill switch，见下
-  ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.settings.installSection(ctx, ACP_SETTINGS_NAMESPACE, AcpSettingsSchema, baseEntry, {
-      validate: (value) => this.validateSettings(value),   // §4.5
-      setSource: (current) => { source = current },        // 官方接线：换活源
-      onChange: () => { applySettingsChange() },
-    })
-    // /acp config 用的服务句柄（同一次注入内捕获；installSection 不吐 scope，不重复注册 namespace）
-    this.settingsService = settingsCtx.settings
-  })
+  …
 }
 ```
 
-**kill switch `settingsEnabled`**（新增组合层专属键，默认 `true`）：为 `false` 时跳过整段接线，
-env 纯读 `source()` 初始值——等价于今天的纯组合层行为。这是功能炸裂时的逃生舱（schema 误报、
-回调异常、注册冲突），不需要卸包重启丢会话现场。它**故意不进 settings schema**——一个通过
-设置层才能关闭自己的开关，在设置层本身坏掉时关不掉。
+与 0.1.x 的关键差别：
 
-为什么选 getter 而不是「变更时重建 env 对象」：`env` 在构造期就被 `makeTools(env)` /
-`acpCommand(env)` 捕获引用，重建对象等于换掉工具闭包里的旧引用，除非重注册工具——那会把阶段一
-做成阶段三级别的手术。getter 让引用恒定、值恒活，与 agent-loop 的
-`get maxParallelToolCalls() { return source().… }` 完全同构，也是宿主钦定形态。
+- **没有 `ctx.inject(['settings'], …)` 接线块**——六键本身就是插件配置（volatile），cordis 直接
+  把引用交给构造器；settings **服务**只在 `/acp config` 写入时才被用到（`getSettingsService()`
+  逐调用 `ctx.get('settings')`，无捕获句柄，服务中途卸载只会让命令降级为指引文案，0.1.x 的
+  attach/detach disposer 舞步对新接缝不再必要）。
+- **没有 `setSource`/`onChange` 回调**——`Volatile` 引用本身就是通知机制（profile 写入后引用
+  读到新值）。变更检测改为 **diff-on-read**：`readSettingsSource` 每次读取都与
+  `this.lastSettings` 浅比较，变化才调 `onSettingsChanged`，未变化的读取零副作用。副作用
+  （清窗口缓存）因此**必然先于**消费端自己的缓存查询发生——每个行动消费端
+  （`windowFor`、pre-step 的 autoNudge 门）入口都先读这条路径，不存在错过生命周期的回调窗口。
+- **首读不触发**：`lastSettings` 初始为 `undefined`，构造后的第一次读取只建立基线。
 
+**kill switch `settingsEnabled`**（组合层专属键，默认 `true`）：0.2.0 上它**只关 `/acp config`
+命令面**（`getSettingsService()` 直接返回 `undefined`）。表单页由宿主从 `static Config` 生成、
+归 profile 所有——插件无法单方面隐藏（`configure({auto:false})` 是全插件级的），旋钮也照常活读
+（它们是插件配置，不是设置服务状态）。关掉后 = 可用的引擎 + 组合行取值 + 无 `/acp config`。
+它仍**故意不在 schema 里**——一个要经设置面才能关掉自己的开关，在设置面本身坏掉时关不掉。
+
+为什么 env 用 getter 而不是「变更时重建 env 对象」：`env` 在构造期就被 `makeTools(env)` /
+`acpCommand(env)` 捕获引用，重建对象等于换掉工具闭包里的旧引用，除非重注册工具。getter 让
+引用恒定、值恒活，与 agent-loop 的 getter 形态同构，也是宿主钦定形态。
 `ToolEnvironment extends KernelConfigInput` 的字段全是 `readonly`——TS 的 getter 天然满足
-readonly 接口，现有类型零改动。测试里手工拼的普通对象 env 不受影响（有值即真值）。
+readonly 接口，现有类型零改动；测试里手工拼的普通对象 env 不受影响（有值即真值）。
 
-### 4.4 变更应用点（onChange 的职责）
+### 4.4 变更应用点（diff-on-read 的职责）
+
+纯 diff 单独成函数（`describeSettingsChange`，src/settings.ts——无 ctx 依赖、单测直测），
+引擎侧的应用器只消费它的产物：
 
 ```ts
 private onSettingsChanged(prev: AcpSettings, next: AcpSettings): void {
+  const effect = describeSettingsChange(prev, next)
+  for (const warning of effect.warnings) {
+    this.ctx.logger.warn(`billion-context-dsh: ${warning}`)
+  }
   // 窗口相关任一键变化 → 清整个窗口缓存。缓存连探测失败一起存（issue #63 的教训），
-  // 清除后下一次 pre-step 立即重新探测——比今天的「重启才能重试」更好。
-  if (prev.modelContextLimit !== next.modelContextLimit
-      || prev.autoModelContextLimit !== next.autoModelContextLimit) {
-    this.windowCache.clear()
-  }
-  // 顺序异常只警告不拒绝（理由见 §4.5）
-  if ((next.nudgeMinContextLimitPct ?? 0) >= next.nudgeMaxContextLimitPct) {
-    this.ctx.logger.warn('billion-context-dsh: nudgeMinContextLimitPct >= nudgeMaxContextLimitPct — growth-based nudges are effectively disabled (over-limit guarantee still applies)')
-  }
-  if (next.nudgeMaxContextLimitPct > next.nudgeEmergencyThresholdPct) {
-    this.ctx.logger.warn('billion-context-dsh: nudgeMaxContextLimitPct > nudgeEmergencyThresholdPct — emergency tier will never fire')
-  }
-  this.ctx.logger.info(`billion-context-dsh: settings updated (compaction-acp)`)
+  // 清除后下一次 pre-step 立即重新探测——比「重启才能重试」更好。
+  if (effect.clearWindowCache) this.windowCache.clear()
+  // nudge 关→开翻转时清去重表：关闭期间写入的记录不得压制重新打开后的第一次 nudge
+  // （advisory 性质，清空的成本只是下一次 nudge 可能早到一拍）。
+  if (effect.clearNudgeDedup) this.lastNudgeTurn.clear()
 }
 ```
 
-- **autoNudge 门**：index.ts:299 改为 `if (!source().autoNudge) return next()`。开关翻转即刻生效。
-  关→开翻转时顺手 `this.lastNudgeTurn.clear()`：kernel 的去重节奏语义（「同 turn 不重复」还是
-  「距上次不足 N turn 跳过」）不构成我们的依赖，清空的成本只是下一次 nudge 可能早到一拍（advisory
-  性质），而留着过期记录的代价可能是重新打开后该响的不响——防御性选便宜的那边。
-- **windowFor**：index.ts:348 的 `this.config.modelContextLimit !== undefined` 改读活源；
-  index.ts:357 的 `autoModelContextLimit` 同理。显式值设置/移除即时切换探测↔显式路径
-  （§6 测试 11 显式锁定这条语义）。
+`describeSettingsChange` 的三个产物：
+
+- `clearWindowCache`：`modelContextLimit` 或 `autoModelContextLimit` 变化。
+- `clearNudgeDedup`：仅 `autoNudge` false→true 翻转（true→false 不清）。
+- `warnings`：**只关于新状态的顺序异常**（min ≥ max「下界永不生效」、max ≥ emergency
+  「紧急档失去余量」）——接受、绝不拒绝：拒绝一次写救不回外部编辑过的 profile，非法存储值
+  下次启动也会响亮失败。警告不依赖 prev 快照（旧代码的反例：同一异常值因 prev 不同时有时无）。
+
+- **autoNudge 门**：pre-step 处 `if (!engine.readSettingsSource().autoNudge) return next()`。
+  开关翻转即刻生效（读取自带 diff 副作用，翻转清去重表由上一条覆盖）。
+- **windowFor**：显式 `modelContextLimit` / `autoModelContextLimit` 分支改读活源；
+  显式值设置/移除即时切换探测↔显式路径（§6 测试锁定这条语义）。
 - **不动的东西**：`kernelConfigFor` 合并逻辑（src/config.ts）、`lastNudgeTurn`、
   `compressCallIdsToHide`、系统提示词 section（文案不含任何阈值数字，阈值变化不影响提示词）、
   四个工具与 `/acp` 命令的注册。
 
-### 4.5 validate 的宽严边界（宁松勿紧）
+### 4.5 校验的宽严边界（宁松勿紧）
 
 **只做 schema 级边界（[0,1] 区间、正整数窗口），不做跨字段拒绝。** 顺序异常
-（min ≥ max、max > emergency）走 §4.4 的警告路径。理由：注册时会校验已存储的 user section，
-若 validate 比**今天的容忍度**更严，一个升级前被默默容忍的手写组合（例如 min=max）会在升级后
-变成启动失败——违背「不破坏现有定制部署」。今天的引擎对任意数值组合都不拒绝（kernel 内部自行
-处理退化情形），所以设置层的写校验不得严于现状。
+（min ≥ max、max > emergency）走 §4.4 的警告路径。v4 注：0.1.x 的 `hooks.validate`
+入口已随 `installSection` 消失——0.2.0 的写校验由 SettingsForms 服务在写入前对 resolved
+候选跑 schema（越界即拒、schemastery 解析时抛错），跨字段的宽容语义由「schema 只声明单键
+边界」这一事实本身保证。理由不变：若写校验比**历史容忍度**更严，一个升级前被默默容忍的
+手写组合（例如 min=max）会在升级后变成启动失败——违背「不破坏现有定制部署」。引擎对任意
+数值组合都不拒绝（kernel 内部自行处理退化情形），设置层的写校验不得严于现状。
 
-### 4.6 `/acp config` 子命令（阶段一b）
+### 4.6 `/acp config` 子命令（阶段一b，v4 形态）
 
-挂在现有 `acpCommand`（src/commands.ts:141-150 的 status|compress|decompress 之后）：
-`/acp config [set <key> <value> | reset <key>|all]`。
+挂在现有 `acpCommand`（src/commands.ts 的 status|compress|decompress 之后）：
+`/acp config [set <key> <value> | reset <key>|all]`。命令面由
+`makeSettingsCommandSurface(getService, getSnapshot)`（src/settings.ts）构建。
 
-- **服务句柄获取**：`SettingsProvider.installSection` 不吐 scope，但 service 级 API 够用。0.1.5 线
-  `installSection` 是 provider 方法、必须在注入回调里调用，所以服务引用就在**同一次注入**内捕获
-  （不重复注册 namespace）：
-  ```ts
-  ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.settings.installSection(ctx, ACP_SETTINGS_NAMESPACE, AcpSettingsSchema, baseEntry, { … })
-    this.settingsService = settingsCtx.settings
-  })
-  ```
-  effect 清理时置回 undefined。`/acp config` 执行时若服务缺席（TUI 纯净 profile 等），
-  输出一句人话：「设置服务在本 profile 未启用，请改用 cordis.patch.yml 的 compaction-acp 行配置」。
-- **`/acp config`（列表）**：`settings.describe()` 过滤出本 namespace，渲染
-  `键 | 生效值 | 来源(default/base/user)` 表——descriptor 同时带 base 与原始 user 层，
-  「user 层含该键」即标记覆盖。若组合层存在同名 `coreOverrides.nudge.*`，在表尾加一行脚注：
-  「nudge 阈值的实际产物以 coreOverrides 为准（它最后合并）」——否则列表展示的设置层生效值会
-  高估自己的权威（评审核验过的误导场景）。
+- **服务句柄获取**：**逐调用解析**——`getService()` 每次现取 `ctx.get('settings')`
+  （`getSettingsService`：先看 `settingsEnabled` kill switch，再看服务在不在）。无捕获句柄，
+  服务中途卸载只会让命令降级为指引文案：「设置服务在本进程不可用，请改用 cordis.patch.yml
+  的 compaction-acp 行配置」——0.1.x 为同一保证维护的 inject disposer 不再需要。
+  服务在场但找不到 `compaction-acp` 条目（引擎没挂在该 id 的组合行下）时给出明确报错，
+  指引检查组合行 id。
+- **`/acp config`（列表）**：`service.describe()` 找到本条目（`String(descriptor.ns) ===
+  'compaction-acp'`——descriptor 的 ns 带编译期 brand，普通字面量直接比较会假失败），
+  渲染 `键 | 生效值 | 来源(default/base/user)` 表——按**键在 descriptor 层里的存在性**
+  归因（base = 继承的组合层，user = 活动 profile 自己的覆盖），不做值比较。若组合层存在同名
+  `coreOverrides.nudge.*`，在表尾加一行脚注：「nudge 阈值的实际产物以 coreOverrides 为准
+  （它最后合并）」——否则列表展示的设置层生效值会高估自己的权威（评审核验过的误导场景）。
 - **`/acp config set <key> <value>`**：value 解析规则（评审 B3 的教训——裸 `JSON.parse` 会把
-  最常见的小数写法弄坏）：
+  最常见的小数写法弄坏；`parseSettingValue` 四步）：
   1. trim 后先匹配字面量 `'true'`/`'false'` → boolean；
   2. 再试 `Number(value)`，有限数即取数字（覆盖 `.7`、`128000`、`1e5` 等一切 JS 数字面量；
      JSON.parse 不接受前导小数点，`.7` 会静默退化成字符串再被 schema 拒掉）；
-  3. `'null'`/`null` → 不走 set，转单键 reset 语义（删 user 层该键；「清回探测模式」的正规
-     入口是 `/acp config reset modelContextLimit`，输出文案里明示）；
-  4. 其余走 `JSON.parse` 兜底字符串（带引号的键名等），失败则报错并附正确用法示例。
-  然后 `settings.update(ACP_SETTINGS_NAMESPACE, { [key]: value })`。捕获
-  `SettingsConflictError` → 提示「配置刚被其他入口修改，请重试」；校验失败把 service 的报错原文
-  （含路径）透出。成功输出注明热生效语义（如涉及窗口键则注明「窗口缓存已清，下次步骤重新探测」），
-  并注明首版未用乐观锁（同键并发写为静默后者胜）。
-- **`/acp config reset <key>|all`**：从 descriptor 读原始 user section，删键（或 `all` →
-  `replace({})` 整体重置回 base+默认）。merge-only patch 表达不了删除，必须走 replace/mutate。
-  输出必须讲清楚回落到哪：「reset to composition base (0.80) — schema default is 0.70;
-  change the compaction-acp composition row or override via coreOverrides if you want a different
-  base」——**reset 回落的是组合行 base，不是引擎默认值**，这是分层模型最反直觉的一点。
-- **单键 reset 只删目标键**：`user` section 里其余键（包括 schema 不认识的）原样写回——设置层不白名单键名
-  （实测：`publish` 未知键会进 `descriptor.user`，`update({bogus: 1})` 也被接受），按 `SETTING_KEYS` 重建 section
-  会静默删掉用户手写的条目。代价是 namespace 里可能出现非六键内容；写回数据始终来自 YAML 文件本身，
-  不会把 `this.config` 的对象/函数值带进设置层（规则 3 不破）。两条 reset 路径与 `set` 共用同一段
-  `SettingsConflictError` 映射，避免并发写冲突以裸 rejection 逃逸。
-- 命令全程进程内调用，**不经过 wire 白名单**，TUI/web/headless 通吃；web 端设置页看不到本
-  namespace 是预期行为（§8），`/acp config` 就是 web 模式下的替代入口。
+  3. `'null'` → 不走 set，转单键 reset 语义（「清回探测模式」的正规入口是
+     `/acp config reset modelContextLimit`，输出文案里明示）；
+  4. 其余拒绝并附正确用法示例。
+  然后先 `describe` 观察 `revision`，再 `service.update(ns, { [key]: value }, revision)` ——
+  **describe-then-write 乐观并发**：读改之间落进来的他人变更表面化为
+  `SettingsConflictError`（「配置刚被其他入口修改，请重试」），而不是静默丢更新；引擎侧
+  捕获后提示重试、**绝不自行重试循环**。校验失败把服务的报错原文（含路径）透出。成功输出
+  注明热生效语义（涉及窗口键则注明「窗口缓存已清，下次步骤重新探测」）。
+- **`/acp config reset <key>|all`**：单键 reset 从 descriptor 读**当前** `user` 层，删目标键后
+  整层写回（`replaceSection(userSectionMinusKey)`）；`reset all` 为 `replaceSection({})`
+  整体重置回 base+默认。merge-only patch 表达不了删除，必须走 replace。**单键 reset 只删
+  目标键**：按 `SETTINGS_KEYS` 重建整层会静默删掉用户手写的其他键——写回数据始终来自
+  descriptor 的 user 层本身，不会把 `this.config` 的对象/函数值带进设置层。输出必须讲清楚
+  回落到哪：「reset to composition base (0.80) — schema default is 0.70; change the
+  compaction-acp composition row or override via coreOverrides if you want a different base」
+  ——**reset 回落的是组合层 base，不是引擎默认值**，这是分层模型最反直觉的一点。两条 reset
+  路径与 `set` 共用同一段 `SettingsConflictError` 映射，避免并发写冲突以裸 rejection 逃逸。
+- 命令全程进程内调用，**不经过 wire 白名单**，TUI/web/headless 通吃；0.2.0 上 web 设置页
+  **本来就能看到本条目**（表单由宿主从 `static Config` 生成，0.1.x 时代的白名单门禁已不存在），
+  `/acp config` 是它的命令行等价物。
 - 输出文案遵守仓库「plain-language」规范；与现有 `/acp status` 输出风格一致（英文正文）。
 
 ### 4.7 依赖与打包
 
-- `package.json` peerDependencies 新增：
-  - `"@deepseek-ai/dsh-settings": ">=0.1.5-alpha.1 <0.1.6-0"` —— 与四个宿主接缝 peer
-    （dsh-compaction / dsh-session / dsh-llm / dsh-tools）**同一形式、同一 0.1.5 下限**。
-    为什么不能再写 0.1.0 线的双元组 clause：现在调用的是 provider 方法
-    `SettingsProvider.installSection`，它只存在于 0.1.5 线；0.1.0/0.1.1 线只有自由函数
-    `installSettingsSection`，装上也无法工作。显式区间钉死整条 0.1.5 线（全部 0.1.5 预发布
-    加最终 0.1.5），`0.1.6-0` 上界挡住未验证的下一线（house rule：不默许未验证的版本线）。
-  - `"@deepseek-ai/schemastery": "^3.18.1"` —— 普通语义化版本，与宿主包一致，无 tuple 问题。
-- devDependencies 新增两者：`dsh-settings` 与宿主接缝 devDep 统一钉在 `0.1.5-rc.2`，
-  `schemastery` 钉在 `3.18.1`（稳定测试基线规则）。
-- tsup external 已按 `@deepseek-ai/*` 前缀外置，无需改（实现时确认 glob 覆盖新包名）。
-- 运行时可解析性依据：两包均为 dsh 安装根 node_modules 内的既存包（dsh-settings 由 apiproxy/
-  client-ui-* 等运行时依赖，schemastery 由约 90 个包含 dsh-compaction-basic 运行时依赖），
-  第三方插件经 Node 祖先链遍历解析；我们现有 `@deepseek-ai/*` peer 走的就是同一机制。
-- `tests/peer-range.test.ts` 把 dsh-settings 并入共享的 `seamPeers` 数组（现五项），与其余四个
-  接缝 peer 共用同一组 0.1.5 断言；原先的 dsh-settings 专属双元组测试块已删除。
+- `package.json` peerDependencies（v4）：
+  - `"@deepseek-ai/dsh-settings": ">=0.2.0-rc.1 <0.2.1-0"` —— 与四个宿主接缝 peer
+    （dsh-compaction / dsh-session / dsh-llm / dsh-tools）**同一形式、同一区间**。
+    为什么不能再写 0.1.5 线：现在调用的是 `SettingsForms` 模型（`static Config` 投影 +
+    `describe`/`update`/`replace` + `SettingsConflictError`），0.1.x 线只有
+    `SettingsProvider.installSection`，装上也无法工作。显式区间钉死整条 0.2.0 线（全部
+    0.2.0 预发布加最终 0.2.0），`0.2.1-0` 上界挡住未验证的下一线（house rule：不默许未
+    验证的版本线；node-semver 把 `0.2.1-0` 排在一切 `0.2.1-x` 预发布之前，所以下一线整体被拒）。
+  - `"@deepseek-ai/schemastery": "^3.18.2"` —— 普通语义化版本，与宿主包一致，无 tuple 问题。
+- devDependencies：`dsh-settings` 与其余宿主接缝 devDep 统一钉在 `0.2.0-rc.2`，
+  `schemastery` 钉在 `3.18.4`（稳定测试基线规则）。
+- tsup external 已按 `@deepseek-ai/*` 前缀外置，无需改（glob 覆盖新包名已确认）。
+- 运行时可解析性依据：两包均为 dsh 安装根 node_modules 内的既存包，第三方插件经 Node
+  祖先链遍历解析；现有 `@deepseek-ai/*` peer 走的就是同一机制。
+- `tests/peer-range.test.ts` 把 dsh-settings 并入共享的 `seamPeers` 数组（五项），与其余
+  四个接缝 peer 共用同一组 `>=0.2.0-rc.1 <0.2.1-0` 断言（整条 0.2.0 线接受、更旧/更新线拒绝）。
 
 ## 5. 明确不做的事（及优先级语义）
 
 | 项 | 决定 | 理由 |
 |---|---|---|
-| 浏览器设置卡片 | 阶段三 | rc.6 时代被 `WEB_SETTINGS_NAMESPACES` 硬编码白名单阻塞（历史记录保留在下方「勘探更新」末条）；**2026-09-06 勘探：0.1.2 线上门禁已解除**，剩余工作见同节 |
+| 浏览器设置卡片 | **v4：需求消失**（原阶段三） | 0.2.0 宿主直接从 `static Config` 自动生成插件设置页，表单由宿主拥有；0.1.x 时代的自建 client 卡片路径（含 `WEB_SETTINGS_NAMESPACES` 白名单门禁、勘探更新全文）随之作废，仅作历史留档保留在下方 |
 
-**浏览器设置卡片·勘探更新（2026-09-06）**——门禁已解除：
+**浏览器设置卡片·勘探更新（2026-09-06）——门禁已解除（0.1.x 时代记录，v4 起整体作废）**：
 
 - **门禁消失**：`WEB_SETTINGS_NAMESPACES` 白名单在 DSH 0.1.2 线源码（master checkout）与实机
   apiproxy 安装版中均已不存在，web wire 不再答 `settings-not-exposed`。
@@ -416,8 +461,8 @@ private onSettingsChanged(prev: AcpSettings, next: AcpSettings): void {
 **优先级总表**（写进 README）：
 
 ```
-coreOverrides.nudge.X  >  settings.yaml compaction-acp.X / 组合行 config.X（base 与 user 同级后者胜）
-                       >  schema 默认值（== 引擎默认）
+coreOverrides.nudge.X  >  profile 覆盖层 compaction-acp.X（user）/ 组合行 config.X（base，user 同键后者胜）
+                       >  schema 默认值（== 引擎默认；三阈值无 schema 默认——组合层 preset 可介入）
 ```
 
 `coreOverrides` 仍是最后的逃生舱：它不经设置层、在 `kernelConfigFor` 里最后合并，所以即使设置层
@@ -430,62 +475,65 @@ coreOverrides.nudge.X  >  settings.yaml compaction-acp.X / 组合行 config.X（
 
 ## 6. 测试计划
 
-新文件 tests/settings.test.ts（Node 内建 test runner，静态 import，禁 `as any`/`require`）：
+tests/settings.test.ts（v4 形态，19 项；Node 内建 test runner，静态 import，禁
+`as any`/`require`）。核心设施：**`FakeSettingsForms`** —— 服务端 fake，持有 descriptor
+（`ns`/`base`/`user` 两层 + `revision`），`describe()` 返回它，`update(ns, patch, expectedRevision)`
+在 revision 不匹配时抛**真实的** `SettingsConflictError`（从 `@deepseek-ai/dsh-settings`
+import，保证 catch 分支与生产同一类错误）、匹配时 merge 进 `user` 层并自增 revision；
+**`LiveKnobs`** —— 一个可变对象包成六个 `{ get() }` 引用，模拟 cordis 的 `Volatile` 热更。
 
-1. **filterSettingsEntry 纯函数**：含 prompts/coreOverrides/countTokens/autoTools/autoCommand
-   的输入 → 输出只含六键；undefined 键不出现在输出对象。
-2. **schema 默认值锁定**：空 section 解析结果 === `{ autoModelContextLimit: true,
-   nudgeMaxContextLimitPct: 0.7, nudgeEmergencyThresholdPct: 0.85, autoNudge: true }`，
-   且 `modelContextLimit`/`nudgeMinContextLimitPct` 为 undefined——与 `DEFAULT_CONFIG` 驱动的
-   现行为逐字段相等（防止未来有人只改一边）。
-3. **getter-env 快照语义**：替换 source thunk 后，`{ ...env }` 展开反映新值；四个 getter 各测；
-   普通对象 env（测试旧路径）不受影响。
-4. **onChange 行为**：modelContextLimit/autoModelContextLimit 变化 → windowCache.clear() 被调用
-   （注入 spy windowFor 或观察后续 windowFor 行为）；阈值变化不清缓存；顺序异常产生 warn 日志、
-   不抛错。
-5. **validate 宽容矩阵**：越界（1.2、-0.1、NaN 序列化形）被 schema 拒；min≥max、max>emergency
-   通过校验。
-6. **detach 回落**：模拟 settings 服务脱离（触发 installSection 的 effect 清理路径）→
-   source 回落到 baseEntry，env 继续可用。（对齐 helper 合同的消费者侧断言。）
-7. **E2E-ish 全环**：用 `@deepseek-ai/dsh-settings` 导出的 `SettingsProvider` 基类造内存 provider
-   ——子类实现 `writable/load/persist` 并在测试里**调用继承的 `this.publish(doc)`** 推送文档
-   （publish 是 protected 方法，调用而非覆写），真实 service + `SettingsProvider.installSection` + 我们的接线：
-   update → watch 回调 → env getter 反映 → kernelConfigFor 产物含新 pct →
-   `replace({})` 重置回落。非法 section publish → last-good 保持。
-8. **`windowFor` 活值语义**：设置 `modelContextLimit: 200000` → `windowFor` 返回
-   `{ limit: 200000, source: 'explicit' }`；再 reset 该键 → 回到探测路径。这是「getter 化是
-   隐式语义变更」的显式锁定用例（评审要求）。
-9. **set 即时可见性**：`update` resolve 完成后、下一个 pre-step 前，`{ ...env }` 已反映新值
-   （写队列串行化保证 update await 返回即生效）。
-10. **kill switch**：`settingsEnabled: false` → 不触发注册路径（spy installSection 或
-    断言无 settings 相关 effect）、env 读初始组合值、行为与今天完全一致。
-11. **autoNudge 翻转**：false→true 时 `lastNudgeTurn.clear()` 被调用；true→false 不清。
-12. **schema 边界实测**：`min(0).max(1)` 是否含边界——0 与 1 必须通过、1.0000001 被拒；
-    `modelContextLimit` 的 `.step(1).min(1)`：1 通过、0 与小数被拒。
-13. **/acp config**：列表输出含来源标记 + coreOverrides 脚注；set 合法/非法键（含 `.7` 小数、
-    `'null'` 转 reset、垃圾串报错文案）；reset 单键与 all 的回落值展示；服务缺席时的降级文案。
-14. **peer-range**：`tests/peer-range.test.ts` 把 dsh-settings 并入 `seamPeers`（五项）共用 0.1.5 断言。
-15. **全量回归**：现有 162+ 测试全绿——env 形状不变是前提，任何下游测试红都说明接线侵入了
-    不该侵入的地方。
-16. **合并评审补齐的回归锁定**（每条都带「改前值 / 改后值」双断言，所以按老代码运行必红）：filtered `base` 入口 +
-    `/acp config list` 来源列；seam → `windowFor` 门（设置层的 `autoModelContextLimit: false` 必须让窗口路径
-    不再走 projection）；`kernelConfigFor` 产物含新 pct；provider 单独 detach 后回落组合值（走 inject disposer）；
-    单键 reset 保留手写键。
+1. **schema 解析形态**：volatile 字段解析成 live 引用；无默认字段缺省读 `undefined`。
+2. **schema 边界 + 透传**：越界值解析时被拒；schema 外的普通键（prompts 等）原样透传。
+3. **normalizeSettingsRefs**：标量 → 常量引用；真引用按同一性透传。
+4. **引擎默认值镜像 SETTING_DEFAULTS**；snapshot 解析补齐缺键。
+5. **parseSettingValue 四步**：布尔/数字/`null`；`false` 是合法值不是错误。
+6. **describeSettingsChange**：清窗口缓存/清 nudge 去重/顺序警告三个产物。
+7. **服务缺席降级**：无服务时命令面 `available === false`、给出指引文案。
+8. **findAcpSettingsDescriptor**：经 `String(ns)` 绕过编译期 brand 匹配条目 id。
+9. **热更全环**：改 LiveKnobs 引用 → 挂载中的引擎读数即时反映（不重建引擎）。
+10. **list/set/reset 全环**：经服务 round-trip，列表来源归因正确。
+11. **并发写**：revision 过期 → 真实 `SettingsConflictError` 冲突文案，不是静默丢更新。
+12. **单键 reset 保手写键**：从 user 层删目标键、其余键原样保留（不按六键白名单重建）。
+13. **kill switch**：`settingsEnabled: false` 只关 `/acp config`——旋钮照常活读。
+14. **逐调用服务解析**：服务晚挂载 → 命令面出现；服务处置 → 命令面消失（无捕获句柄可过期）。
+15. **服务在而条目不在**：降级为指引（组合行 id 不符的明确报错）。
+16. **preset 填补**：无人显式设置的阈值由组合层 `preset` 填上（显式值 > preset > 默认）——
+    锁定「三阈值无 schema 默认」的设计动机。
+17. **autoModelContextLimit: false 活值门**（B1 锁，新接缝）：窗口路径不再走投影。
+18. **diff-on-read 清缓存**：旋钮变化后的下一次读取清 per-route 窗口缓存。
+19. **构造期展平**：标量旋钮展开进普通 config，引用永不泄漏进 `AcpConfig`。
+
+另：`tests/peer-range.test.ts`（dsh-settings 并入 `seamPeers` 五项共用 0.2.0 区间断言）；
+全量回归 321 项（env 形状不变是前提，任何下游测试红都说明接线侵入了不该侵入的地方）。
+0.1.x 测试计划（installSection/watch/publish 全环、detach 回落等 16 条）随接缝一并退役，
+历史版本见 git 历史。
 
 ## 7. 文档同步清单（同一 PR 内完成）
 
-- README.md / README.en.md：配置表标注哪些键可热调（用 ✅/— 脚注式标记，不重构现有
-  键/默认值/含义三列结构）；新增「运行时设置」节（settings.yaml 示例 + 优先级总表 +
-  「reset 回落到组合行 base」的说明 + `/acp config` 用法）。
-- docs/INSTALL.md：组合选项处补一段「settings.yaml 是运行时覆盖层」。
-- docs/settings-integration-design.md：本文。
-- AGENTS.md：模块图加 `src/settings.ts # M6`; 若实现中发现新的坑，沉淀为 hard-won rule
-  （候选：「base 必须过滤到 schema 已知键」「写校验不得严于历史容忍度」）。
-- docs/dsh-porting-verification.md：无需动（非 UPSTREAM workaround）。
+v4（0.2.0 移植 PR）清单：
+
+- README.md / README.en.md：兼容性块（peer 区间 `>=0.2.0-rc.1 <0.2.1-0`、三处接缝破坏点）、
+  「运行时设置」节重写（SettingsForms：宿主设置页 + `/acp config`，删除 settings.yaml 示例）、
+  `settingsEnabled` / `preset` 行的语义措辞、架构模块图补 `settings.ts` / `presets.ts` /
+  `prompts.ts` / `host-tokens.ts`。
+- docs/INSTALL.md：依赖说明段（peer 区间与破坏点）、热调段落。
+- docs/settings-integration-design.md：本文（v4 全量同步）。
+- AGENTS.md：模块图 `src/settings.ts # M6` 行、规则 17 全量重写（SettingsForms 模型）。
+- docs/e2e-harness-design.md：harness 挂 no-op settings 服务一节（真实 SettingsForms 归宿主，
+  单测 fake 覆盖）。
+
+v2 清单（历史，已完成）：README 两份新增「运行时设置」节与热调标注、INSTALL 补段、本文、
+AGENTS.md 模块图与规则沉淀、dsh-porting-verification.md 无需动（非 UPSTREAM workaround）。
 
 ## 8. 风险与开放问题
 
-v2 状态：R1–R5 已由评审核验关闭，遗留两个实现期验证门（V1/V2）。
+v4 状态：接缝整体替换后，0.1.x 风险登记表里的条目大多随 `installSection` 一并退役——
+R3（HMR 重复注册 namespace）/V1（dispose 与构造竞争）所针对的「我们自己注册 namespace」
+动作已不存在（宿主从 `static Config` 投影，无插件侧注册）；R5 的「首版不带乐观锁」决定被
+v4 反转（describe-then-write + `SettingsConflictError`，§4.6）。v4 遗留：无（表单页归宿主
+所有，插件侧无 UI 风险；`Volatile` 引用读取失败路径由 try/catch 兜底并有测试 14 锁定）。
+
+v2 状态（历史，随 0.1.x 接缝退役）：R1–R5 已由评审核验关闭，遗留两个实现期验证门（V1/V2）。
 
 - **R1 schemastery API —— 已关闭**。`.int()`/`.positive()` 在 3.18.1 不存在（number 链仅
   min/max/step/pattern，lib/index.mjs:168-300；`Schema.natural = number().step(1).min(0)`）。
@@ -513,6 +561,18 @@ v2 状态：R1–R5 已由评审核验关闭，遗留两个实现期验证门（
 
 ## 修订记录
 
+- **v4（0.2.0 SettingsForms 重设计）**：宿主 0.2.0 线把 settings 接缝整体替换为
+  SettingsForms 模型——插件声明 `static Config`（volatile 字段）、宿主从 schema 生成设置页、
+  `ctx.get('settings')` 返回 `SettingsForms` 服务（describe/update/replace + revision 乐观
+  并发）、`ctx.get('settings')` 缺席即 `undefined`。引擎侧改动：schema 三阈值去掉 `.default()`
+  改为纯 `.volatile()`（组合层 `preset` 才能填补）、布尔默认改由 `SETTING_DEFAULTS` 派生；
+  `installSection`/`filterSettingsEntry`/`setSource`/`onChange`/inject-disposer 全部删除，
+  取代为 `normalizeSettingsRefs`（Volatile 引用归一）+ `readSettingsSource`（diff-on-read）+
+  `describeSettingsChange`（纯 diff）+ `makeSettingsCommandSurface`（逐调用服务解析、
+  describe-then-write、单键 reset 从 user 层删键）。`settingsEnabled` 语义收窄为只关
+  `/acp config` 命令面。测试重写为 19 项（FakeSettingsForms + LiveKnobs）。本文档全量同步：
+  §1 接缝（0.2.0 现状块，0.1.x 降级历史）、§3 数据流、§4.1–§4.7、§5 浏览器卡片（需求消失）、
+  §6 测试计划、§7 清单、§8 风险。
 - **v3（0.1.5 接缝对齐，仅文档）**：PR #130 初版基于 dsh-settings 0.1.0-rc.6 的自由函数
   `installSettingsSection` + `settingsNamespace()` 编写；宿主线升到 0.1.5 后两者都已删除
   （`installSection` 成为 provider 方法、namespace 变普通字符串字面量），源代码与测试已经适配。

@@ -319,18 +319,56 @@ test('L3: estimateHostContent mirrors the host estimator exactly (edge cases)', 
   assert.equal(estimateHostContent([{ type: 'text', text: '中文面试' }]), 5)
   // tool-call: ceil(4/4) + ceil(13/4) + 4 = 1 + 4 + 4 = 9
   assert.equal(estimateHostContent([{ type: 'tool-call', name: 'bash', arguments: '{"command":"ls"}' }]), 9)
-  // tool-result with STRING content: every char falls to the default branch
-  // (4 + ceil(JSON.stringify(char)/4) = 5 per unescaped char).
-  assert.equal(estimateHostContent([{ type: 'tool-result', toolCallId: 'x', content: 'abc' }]), 3 * 5 + 4)
-  // nested tool-result content blocks recurse.
-  assert.equal(estimateHostContent([{ type: 'tool-result', toolCallId: 'x', content: [{ type: 'text', text: 'abcd' }] }]), 5 + 4)
+  // tool-result — ANY content: the stateVersion-5 estimator has NO tool-result
+  // arm, so the whole block prices through the structural default
+  // (4 + ceil(JSON.stringify(ORIGINAL block)/4)). This covers the legacy
+  // nested shape (0.1.5/0.1.7 logs) and string content alike, exactly as the
+  // LIVE meter re-prices those rows.
+  const legacyString = { type: 'tool-result', toolCallId: 'x', content: 'abc' }
+  assert.equal(estimateHostContent([legacyString]), 4 + Math.ceil(JSON.stringify(legacyString).length / 4))
+  const legacyNested = { type: 'tool-result', toolCallId: 'x', content: [{ type: 'text', text: 'abcd' }] }
+  assert.equal(estimateHostContent([legacyNested]), 4 + Math.ceil(JSON.stringify(legacyNested).length / 4))
+  // image: the structural arm strips the offload marker before stringifying
+  // (request-side state, not heuristic content).
+  const image = { type: 'image', url: 'https://x/img.png', offloaded: 'marker-state' }
+  const { offloaded: _stripped, ...imageReference } = image
+  assert.equal(estimateHostContent([image]), 4 + Math.ceil(JSON.stringify(imageReference).length / 4))
   // unknown block: 4 + ceil(JSON.stringify/4) over the ORIGINAL object.
   const weird = { type: 'custom-block', payload: 'abcdefgh' }
   const expected = 4 + Math.ceil(JSON.stringify(weird).length / 4)
   assert.equal(estimateHostContent([weird]), expected)
-  // empty content / empty string.
+  // empty content.
   assert.equal(estimateHostContent([]), 0)
-  assert.equal(estimateHostContent(''), 0)
+})
+
+test('L3: the mirror stays byte-exact against the REAL host estimator (drift tripwire)', async () => {
+  // Rule 12's whole guarantee rests on the mirror tracking
+  // `@deepseek-ai/dsh-token-meter`'s estimator. Hardcoded expectations above
+  // pin the arithmetic; THIS test pins the relationship — it prices the same
+  // battery through the real host module (a devDep, the exact rc the port
+  // targets) and fails the suite if a dependency bump ever changes the host
+  // vocabulary without the mirror following.
+  const { estimateContent } = await import('@deepseek-ai/dsh-token-meter/estimate')
+  const battery: Array<readonly object[]> = [
+    [{ type: 'text', text: 'plain ascii text' }],
+    [{ type: 'text', text: '中文面试要点' }],
+    [{ type: 'reasoning', text: 'thinking...' }],
+    [{ type: 'tool-call', name: 'bash', arguments: '{"command":"ls -la"}' }],
+    [{ type: 'tool-result', toolCallId: 'c1', content: 'string body' }],
+    [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'nested body' }] }],
+    [{ type: 'image', url: 'https://x/img.png', offloaded: 'off' }],
+    [{ type: 'image', url: 'https://x/img.png' }],
+    [{ type: 'custom-block', payload: { a: 1, b: [2, 3] } }],
+    [{ type: 'text', text: 'a' }, { type: 'weird' }, { type: 'text', text: '中文' }],
+    [],
+  ]
+  for (const blocks of battery) {
+    assert.equal(
+      estimateHostContent(blocks as never),
+      estimateContent(blocks as never),
+      `mirror drifted from the host estimator on ${JSON.stringify(blocks)}`,
+    )
+  }
 })
 
 test('L3: hostPriceEvent projects non-surface events to 0 and empty assistant messages to 0', () => {

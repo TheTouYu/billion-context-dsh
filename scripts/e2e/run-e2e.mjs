@@ -13,10 +13,24 @@ const nudgeIndices = (requests) => {
   })
   return list
 }
+// On the 0.2.0 Messages wire the system prompt rides the top-level `system`
+// param (not messages[0]), and tool results ride INSIDE user messages as
+// `tool_result` blocks referencing the previous assistant `tool_use` ids —
+// strict pairing therefore means: every tool_result block's tool_use_id must
+// resolve against the immediately preceding assistant message.
 const wirePairing = (requests) => {
   const last = requests.filter((request) => request.kind === 'tool').slice(-1)[0]
-  const roles = last.body.messages.map((message) => message.role)
-  return roles.every((role, i) => role === 'tool' ? i > 0 && roles[i - 1] === 'assistant' : true)
+  const messages = last?.body?.messages ?? []
+  for (let i = 0; i < messages.length; i += 1) {
+    const blocks = messages[i].content ?? []
+    const results = blocks.filter((block) => block.type === 'tool_result')
+    if (results.length === 0) continue
+    const prev = messages[i - 1]
+    if (!prev || prev.role !== 'assistant') return false
+    const uses = (prev.content ?? []).filter((block) => block.type === 'tool_use')
+    return results.every((result) => uses.some((use) => use.id === result.tool_use_id))
+  }
+  return true
 }
 const lastEndSeq = (events) => {
   const best = { seq: 0 }
@@ -163,12 +177,25 @@ const cachePrefixChecks = (result) => {
   const schemas = new Set(requests.map((request) => JSON.stringify(request.body.tools ?? null)))
   list.push(['wire: tools array byte-stable across requests', schemas.size === 1, `${schemas.size} distinct schema(s)`])
 
-  // The leading message is the largest cacheable prefix. Compare from the second request
-  // on: the engine injects its one-time ACP guidance section during the first turn's
-  // pre-step, so request 1 may legitimately precede that injection.
-  const leading = requests.slice(1).map((request) => JSON.stringify(outboundMessagesOf(request)[0] ?? null))
-  const leadingDistinct = new Set(leading).size
-  list.push(['wire: leading message byte-stable after request 1', leadingDistinct === 1, `${leadingDistinct} distinct`])
+  // On the 0.2.0 Messages wire the system prompt is the top-level `system`
+  // param — the largest cacheable prefix and one that must NEVER move across
+  // a scenario's LLM calls, compaction or not.
+  const systems = new Set(requests.map((request) => JSON.stringify(request.body.system ?? null)))
+  list.push(['wire: system prompt byte-stable across requests', systems.size === 1, `${systems.size} distinct`])
+
+  // messages[0] is the first USER message on this wire. It must stay
+  // byte-stable across requests EXCEPT when a compaction legitimately
+  // rewrote the surface (the durable replace): each distinct change in the
+  // leading message must be paid for by a compaction/summary event.
+  // Request 1's one-time ACP guidance injection allowance (below) covers the
+  // first group, so groups-1 must not exceed the compaction count.
+  const leadingRequests = requests.slice(1)
+  let groups = leadingRequests.length === 0 ? 0 : 1
+  for (let i = 1; i < leadingRequests.length; i += 1) {
+    if (JSON.stringify(outboundMessagesOf(leadingRequests[i])[0] ?? null) !== JSON.stringify(outboundMessagesOf(leadingRequests[i - 1])[0] ?? null)) groups += 1
+  }
+  const compactions = result.events.filter((event) => event.type === 'compaction/summary').length
+  list.push(['wire: leading message byte-stable except across a compaction', groups - 1 <= compactions, `groups=${groups} compactions=${compactions}`])
 
   // A scenario with no compaction is append-only by construction, so the previous
   // request's message list must be a byte-identical prefix of the next one — any

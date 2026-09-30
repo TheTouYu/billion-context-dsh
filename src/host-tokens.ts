@@ -43,11 +43,8 @@ export type HostBlock =
   | { type: 'text'; text: string }
   | { type: 'reasoning'; text: string }
   | { type: 'tool-call'; name: string; arguments: string }
-  | { type: 'tool-result'; toolCallId: string; content: HostContent }
+  | { type: 'tool-result'; toolCallId: string; content: readonly HostBlock[] | string }
   | { type?: string } & Record<string, unknown>
-
-/** A content block list, or a bare string (`tool-result` content may be either). */
-export type HostContent = readonly HostBlock[] | string
 
 function blockType(block: unknown): string | undefined {
   if (typeof block !== 'object' || block === null) return undefined
@@ -56,22 +53,34 @@ function blockType(block: unknown): string | undefined {
 }
 
 /**
- * Exact mirror of the host's `estimateContent`
- * (`@deepseek-ai/dsh-token-meter/lib/types/estimate.js`): text/reasoning
- * `ceil(len/4)+4`, tool-call `ceil(name/4)+ceil(arguments/4)+4`, tool-result
- * recursive over its content, unknown blocks `4+ceil(JSON.stringify/4)` over
- * the ORIGINAL block object. A string content is iterated as an iterable, so
- * every CHARACTER falls to the default branch (`4+ceil(JSON.stringify(char)/4)`
- * — 5 tokens for any single unescaped character).
+ * Exact mirror of the host's `estimateStructuralBlock`: the structural JSON
+ * price for merge-extended blocks and image references. The `image` arm strips
+ * the offload marker before stringifying (the marker is request-side state,
+ * not heuristic content — added with the 0.2.0 estimator, stateVersion 5);
+ * everything else prices the ORIGINAL block object.
  */
-export function estimateHostContent(blocks: HostContent): number {
-  if (typeof blocks === 'string') {
-    let tokens = 0
-    for (const char of blocks) {
-      tokens += BLOCK_OVERHEAD + Math.ceil(JSON.stringify(char).length / CHARS_PER_TOKEN)
-    }
-    return tokens
+function estimateStructuralBlock(block: HostBlock): number {
+  if (blockType(block) === 'image') {
+    const reference = { ...(block as Record<string, unknown>) }
+    delete reference.offloaded
+    return BLOCK_OVERHEAD + Math.ceil(JSON.stringify(reference).length / CHARS_PER_TOKEN)
   }
+  return BLOCK_OVERHEAD + Math.ceil(JSON.stringify(block).length / CHARS_PER_TOKEN)
+}
+
+/**
+ * Exact mirror of the host's `estimateContent`
+ * (`@deepseek-ai/dsh-token-meter/lib/types/estimate.js`, 0.2.0 estimator):
+ * text/reasoning `ceil(len/4)+4`, tool-call `ceil(name/4)+ceil(arguments/4)+4`,
+ * and EVERY other block — including `tool-result` and image references —
+ * through the structural arm above. The 0.1.5 estimator recursed into
+ * `tool-result` content; that arm is GONE on this line (stateVersion 5), so a
+ * legacy nested `tool-result` block (0.1.5/0.1.7 logs) prices as
+ * `4+ceil(JSON.stringify(whole block)/4)` — which is also what the LIVE meter
+ * does when it re-prices those rows, so the mirror stays exact against the
+ * same claim basis.
+ */
+export function estimateHostContent(blocks: readonly HostBlock[]): number {
   let tokens = 0
   for (const block of blocks) {
     switch (blockType(block)) {
@@ -87,19 +96,15 @@ export function estimateHostContent(blocks: HostContent): number {
           + BLOCK_OVERHEAD
         break
       }
-      case 'tool-result': {
-        tokens += estimateHostContent((block as { content: HostContent }).content) + BLOCK_OVERHEAD
-        break
-      }
       default:
-        tokens += BLOCK_OVERHEAD + Math.ceil(JSON.stringify(block).length / CHARS_PER_TOKEN)
+        tokens += estimateStructuralBlock(block)
     }
   }
   return tokens
 }
 
 /** Exact mirror of the host's `estimateMessage` (content + role framing). */
-export function estimateHostMessage(message: { content: HostContent }): number {
+export function estimateHostMessage(message: { content: readonly HostBlock[] }): number {
   return estimateHostContent(message.content) + ROLE_OVERHEAD
 }
 
@@ -110,7 +115,7 @@ export function estimateHostMessage(message: { content: HostContent }): number {
  */
 export function hostPriceEvent(event: SessionEvent): number {
   const message = deriveEventMessage(event)
-  return message === null ? 0 : estimateHostMessage(message as { content: HostContent })
+  return message === null ? 0 : estimateHostMessage(message as { content: readonly HostBlock[] })
 }
 
 /** Mirror price of a set of surface seqs (the fallback claim computation). */
