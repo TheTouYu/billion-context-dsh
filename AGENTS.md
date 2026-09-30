@@ -15,7 +15,7 @@ The model decides *when* and *what* to compress — not a hard limit. Automatic 
 | Language | TypeScript (strict, ESM, `.ts` import suffixes) |
 | Build | tsup (bundles, **inlines acp-kernel**; `@deepseek-ai/*` stays external) |
 | Test | Node.js built-in: `node --import tsx --test tests/*.test.ts tests/kernel-upstream/*.test.ts` |
-| Runtime Deps | `acp-kernel` (inlined at build); peers: `@deepseek-ai/dsh-compaction`, `dsh-session`, `dsh-llm`, `dsh-tools`, `dsh-settings` (each `>=0.2.0-rc.1 <0.2.1-0`), `@deepseek-ai/cordis` (^4), `@deepseek-ai/cosmokit` (^1.8.5), `@deepseek-ai/schemastery` (^3.18) |
+| Runtime Deps | `acp-kernel` (inlined at build); peers: `@deepseek-ai/dsh-compaction`, `dsh-session`, `dsh-llm`, `dsh-tools`, `dsh-settings` (each `>=0.2.0-rc.1 <0.2.1-0`), `@deepseek-ai/cordis` (^4), `@deepseek-ai/schemastery` (^3.18) |
 | Host | DeepSeek Harness (composition row `name: 'billion-context-dsh'`) |
 
 ## 2. Architecture — module map
