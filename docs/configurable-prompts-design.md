@@ -18,7 +18,7 @@
 > - **K1**:默认 nudge 文案对齐 kernel——普通档首句从"suggestion, not a requirement"改为"efficiency nudge to compress early and keep context lean";紧急档从"Consider…the choice is yours"改为"⚠️ Context limit reached — compress now";两档均在模板中嵌入 `{philosophy}`(kernel `COMPRESS_PHILOSOPHY`)。
 > - **K2**:`NudgePrompts` 新增 3 个槽位——`breakdown`(上下文分解,占位符 `{system} {tool} {summaries} {code} {text}`)、`growth`(增长行,`{growth}`)、`tip`(批量压缩提示,无占位符);默认值逐字对齐 kernel `nudge-text.ts` 的 `formatBreakdown` / `formatRanges` 尾部 `💡` 行。
 > - **K3**:nudge 装配顺序对齐 kernel `renderNudgeText`——`frame(内嵌 philosophy)` → `breakdown` → `growth` → `guidance`(默认 = kernel `HOW_TO_COMPRESS_RULES`) → `tier` 行(+ kernel `TIER2_DISTILL_RULES`/`TIER3_CONDENSE_RULES`) → 范围表(仅非 tier nudge) → `tip`。**tier nudge 不再渲染范围表**(tier 目标块由 tier 行 + 蒸馏规则承载,与 kernel 一致)。
-> - **K4**:system prompt 模板新增占位符 `{howToCompressRules}` / `{tier2DistillRules}` / `{tier3CondenseRules}`(分别注入 kernel `HOW_TO_COMPRESS_RULES` / `TIER2_DISTILL_RULES` / `TIER3_CONDENSE_RULES`),并新增 `WHEN TO COMPRESS` / `WHEN NOT TO COMPRESS` 场景清单(对齐 pi 的 `ACP_SYSTEM_PROMPT`);首段去掉 "Nothing forces you" 语气,改为效率通知框架。
+> - **K4**:system prompt 模板新增占位符 `{howToCompressRules}`(注入 kernel `HOW_TO_COMPRESS_RULES`),并新增 `WHEN TO COMPRESS` / `WHEN NOT TO COMPRESS` 场景清单(对齐 pi 的 `ACP_SYSTEM_PROMPT`);首段去掉 "Nothing forces you" 语气,改为效率通知框架。**2026-10-14 降级(遵从天花板)**:`{tier2DistillRules}`/`{tier3CondenseRules}` 已从系统提示词移除——tier2/3 格式与预算改住在 compress 工具描述里(做蒸馏那一刻才需要,不为每次无关任务收注意力税);系统提示词只留 tier 概念段 + 指针。`SYSTEM_ALLOWED` 仍接受这两个占位符,宿主覆盖模板时可自行加回。
 > - **K5**:`renderSystemPrompt` 的注入变量从 `{philosophy}` 单占位符扩展为 4 个;`buildNudgeText` 的 `{philosophy}` 由调用方渲染(normal/emergency 模板内嵌)。
 >
 > **修订记录(v4,终审后精度修正;第三轮评审实测结论:通过,可进入实现):**
@@ -75,7 +75,7 @@ billion-context-dsh 目前所有"模型可见"的提示词文本都是硬编码�
 | P9 | nudge 增长行 | `src/prompts.ts`(DEFAULT_PROMPTS.nudge.growth) | "+26K since last nudge" | `{growth}` |
 | P10 | nudge 批量提示 | `src/prompts.ts`(DEFAULT_PROMPTS.nudge.tip) | "💡 Compress all ranges in one call (pass multiple content entries: `content: [{...}, {...}]`)." | 无 |
 | P5 | nudge 范围表 | `src/nudge.ts`(rangeTable) | 表头 "Surface: …" + 标题 + 每行 + 表尾调用语法 | 表头 `{surface}`;标题 `{count}`;行 `{start} {end} {count} {tokens}`;表尾无 |
-| P6 | system prompt(一次性) | `src/system-prompt.ts` | 整段 ACP 指导:效率通知框架 + philosophy + WHEN TO/WHEN NOT + HOW_TO_COMPRESS_RULES + 工具描述 + tier 蒸馏/浓缩规则 | `{philosophy}` `{howToCompressRules}` `{tier2DistillRules}` `{tier3CondenseRules}` |
+| P6 | system prompt(一次性) | `src/system-prompt.ts` | 整段 ACP 指导:效率通知框架 + philosophy + WHEN TO/WHEN NOT + HOW_TO_COMPRESS_RULES + 工具速查行(详细语义在各工具描述) + tier 概念与指针(格式在 compress 工具描述) | `{philosophy}` `{howToCompressRules}` |
 | P7 | 工具描述 | `src/tools.ts:500-535` | compress / decompress / search_context / acp_status 的 description | 无 |
 
 ## 3. 核心机制:模板 + 命名占位符
