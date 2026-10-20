@@ -22,16 +22,20 @@ import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defaultCountTokens } from 'acp-kernel'
 import {
   classifySurfaceEvent,
-  engineSource,
+  checkpointCompactionIdOf,
   extractEventText,
+  attachmentsOfEvent,
+  mediaBlocksOfEvent,
   extractText,
   isAgentInstructionsRow,
   isCheckpointNode,
   isRealUserTurn,
+  isSkillCatalogRow,
   toolCallIdOfResultEvent,
+  toolCallsOf,
   withSummaryFramePrefix,
 } from './messages.ts'
-import { hostPriceEvent } from './host-tokens.ts'
+import { hostMediaStructuralPrice, hostPriceEvent } from './host-tokens.ts'
 import { eventAtOf, sessionEventsOf } from './session-events.ts'
 import { decodeAcpBlockLedger, encodeAcpBlockLedger, type AcpBlockLedgerPayload } from './block-ledger.ts'
 
@@ -108,33 +112,49 @@ export function assertNoActiveCompaction(events: readonly SessionEvent[]): void 
 }
 
 /**
- * Whether the surface node at `seq` projects to CoreMessage(s) whose ref key
- * is the bare seq — user messages, tool results, and text-only or SINGLE
- * tool-call assistant messages all do. Multi-tool-call assistant messages
- * project to `${seq}#${callId}` ids (projectEvent) and therefore carry NO
- * bare-`${seq}` ref, so compress's byRaw lookup can never resolve them as
- * range edges. resolveSurfaceRange treats such edges as unbalanced and shifts
- * them to the nearest clean cut.
+ * Whether the surface node at `seq` may ANCHOR a compress range edge — i.e. a
+ * balanced cut here maps onto kernel refs that name the shadowed span.
+ *
+ * The predecessor of this predicate was `hasPlainRef`, which answered "does
+ * this node project to a CoreMessage whose id is the bare seq?" That conflated
+ * being a legal cut (a tool-pairing question, decided by the host helpers)
+ * with carrying a bare-seq id (an id-dialect detail), and it permanently
+ * dead-zoned two real shapes (issue #155):
+ *
+ * - A MULTI-TOOL-CALL assistant message projects to `${seq}#${callId}`
+ *   sub-messages (projectEvent) — no bare id — yet cutting BEFORE it at a
+ *   balanced point is exactly safe: every earlier pair is already closed, and
+ *   the node's own calls pair with results INSIDE any span that starts here.
+ *   Such a node can never be a legal END edge anyway (its open calls make
+ *   every cut after it unbalanced), so only the start side matters. The ref
+ *   layer maps the edge onto the node's sub-ids (edgeRefForSeq in tools.ts).
+ * - An EMPTY tool result projects to NO message at all. It carries no
+ *   characters, so anchoring a cut on it loses nothing; the host's pairing
+ *   balance counts it like any other result (-1), so balance at its cuts is
+ *   well-defined. The ref layer falls back to the nearest message-bearing
+ *   node inside the span.
+ *
+ * Everything else keeps the old rule: a user turn anchors only with non-empty
+ * text (an empty user message projects to nothing and is almost always the
+ * protected last turn); a call-less assistant anchors only with non-empty
+ * text; system nodes never anchor.
  */
-function hasPlainRef(session: Session, seq: number): boolean {
+function anchorsRangeEdge(session: Session, seq: number): boolean {
   const event = eventAtOf(session, seq)
   if (event === undefined) return false
+  if (isSystemNode(event)) return false
   switch (event.type) {
     case 'user/message':
-    case 'tool/result':
       return extractEventText(event).trim().length > 0
     case 'assistant/message': {
       const content = (event.data as { message?: { content?: unknown } }).message?.content
-      const calls = Array.isArray(content)
-        ? content.filter(
-            (block) => block !== null && typeof block === 'object' && (block as { type?: string }).type === 'tool-call',
-          )
-        : []
-      if (calls.length > 1) return false
-      // One tool-call: projectEvent emits a bare-seq CoreMessage unconditionally.
-      // Zero: only when the text is non-empty.
-      return calls.length === 1 || extractEventText(event).trim().length > 0
+      // Any tool-call count (including multi-call, which anchors via its
+      // `${seq}#${callId}` sub-ids) or non-empty text makes the node a valid
+      // edge; only a fully empty projection is not.
+      return toolCallsOf(content).length > 0 || extractText(content).trim().length > 0
     }
+    case 'tool/result':
+      return true
     default:
       return false
   }
@@ -220,14 +240,15 @@ export interface ResolvedSurfaceRange {
 
 /**
  * Validate one inclusive surface span and adjust its edges to a
- * tool-pairing-balanced range whose boundaries carry a bare-seq ref. Reversed
- * ranges throw. An edge that sits inside a tool-call/result pair — or on a
- * multi-tool-call assistant message that has no bare-seq ref — is first nudged
- * inward to the nearest clean cut; if that collapses the range (e.g. the model
- * asked for a SINGLE tool result, which can never be balanced alone), the
- * range EXPANDS outward to the enclosing clean pair instead — a lone tool
- * message is almost always a "consumed output" the model genuinely wants to
- * compress. The returned range is what a caller should actually shadow.
+ * tool-pairing-balanced range whose boundaries anchor (bare-`${seq}` ref,
+ * multi-call sub-id, or empty-result fallback — see anchorsRangeEdge,
+ * issue #155). Reversed ranges throw. An edge that sits inside a
+ * tool-call/result pair is first nudged inward to the nearest clean cut; if
+ * that collapses the range (e.g. the model asked for a SINGLE tool result,
+ * which can never be balanced alone), the range EXPANDS outward to the
+ * enclosing clean pair instead — a lone tool message is almost always a
+ * "consumed output" the model genuinely wants to compress. The returned range
+ * is what a caller should actually shadow.
  *
  * Missing edges are NOT an immediate error: the seqs were probably shadowed by
  * an earlier compression (stale nudge table / old compress result). The span
@@ -283,25 +304,25 @@ export function resolveSurfaceRange(
   if (start > end) {
     throw new Error(`billion-context-dsh: reversed range ${start}..${end}`)
   }
-  // A boundary must be BOTH tool-pairing-balanced AND carry a bare-seq ref.
-  // A boundary must be BOTH tool-pairing-balanced AND carry a bare-seq ref,
-  // and never a host system prompt. The system check is explicit, not
-  // incidental: `hasPlainRef` happens to return false for `system/message`,
-  // but riding that default would silently invert if the projection ever
-  // learns to emit a bare-seq ref for system nodes.
+  // A boundary must be BOTH tool-pairing-balanced AND anchorable: the cut must
+  // map onto kernel refs that name the shadowed span (bare-`${seq}` id, a
+  // multi-call node's `${seq}#${callId}` sub-ids, or the empty-result fallback
+  // — see anchorsRangeEdge / edgeRefForSeq). The system-node exclusion is
+  // incidental: anchorsRangeEdge returns false for `system/message`, so keep it
+  // explicit rather than relying on the coincidence.
   const cleanBefore = (index: number): boolean => {
-    const event = eventAtOf(session, nodes[index]!)
-    return event !== undefined
-      && !isSystemNode(event)
-      && toolPairingBalancedBefore(session, nodes[index]!)
-      && hasPlainRef(session, nodes[index]!)
+    const node = nodes[index]!
+    const event = eventAtOf(session, node)
+    if (event === undefined || isSystemNode(event)) return false
+    if (!toolPairingBalancedBefore(session, node)) return false
+    return anchorsRangeEdge(session, node)
   }
   const cleanAfter = (index: number): boolean => {
-    const event = eventAtOf(session, nodes[index]!)
-    return event !== undefined
-      && !isSystemNode(event)
-      && toolPairingBalancedAfter(session, nodes[index]!)
-      && hasPlainRef(session, nodes[index]!)
+    const node = nodes[index]!
+    const event = eventAtOf(session, node)
+    if (event === undefined || isSystemNode(event)) return false
+    if (!toolPairingBalancedAfter(session, node)) return false
+    return anchorsRangeEdge(session, node)
   }
   let startIdx = requestedStartIdx
   let endIdx = requestedEndIdx
@@ -356,6 +377,31 @@ export function shadowedSeqsOf(session: Session, start: number, end: number): nu
   const startIdx = nodes.indexOf(start as SurfaceSeq)
   const endIdx = nodes.indexOf(end as SurfaceSeq)
   return nodes.slice(startIdx, endIdx + 1)
+}
+
+/**
+ * True iff `declared` equals the CURRENT surface slice between `start` and
+ * `end` positionally — both edges on the surface, in order, element-wise equal.
+ * This mirrors exactly the invariant the released readers enforce at load time
+ * on every `compaction/summary` / `compaction/prune` event (`shadowedSeqs` must
+ * name an exact current surface span); writing an event that violates it makes
+ * the whole session log unloadable forever (issue #201). Unlike
+ * {@link shadowedSeqsOf} (which silently degrades for read-only probes), this
+ * is the strict gate for WRITES.
+ */
+export function isExactSurfaceSpan(
+  session: Session,
+  start: number,
+  end: number,
+  declared: readonly number[],
+): boolean {
+  if (start > end || declared.length === 0) return false
+  const nodes = session.surface.nodes
+  const startIdx = nodes.indexOf(start as SurfaceSeq)
+  const endIdx = nodes.indexOf(end as SurfaceSeq)
+  if (startIdx < 0 || endIdx < startIdx) return false
+  const slice = nodes.slice(startIdx, endIdx + 1)
+  return slice.length === declared.length && slice.every((seq, index) => Number(seq) === declared[index])
 }
 
 export interface CompactionTransactionInput {
@@ -423,6 +469,59 @@ export function prefixSummaryBlocks(blocks: readonly ContentBlock[]): ContentBlo
 }
 
 /**
+ * Checkpoint source for the durable summary node, normalized for V4 writers.
+ *
+ * The copy of @deepseek-ai/dsh-compaction this engine resolves to may predate
+ * the host persisting the session: the plugin's peer range floors at the
+ * 0.1.5 line, whose compactCheckpointSource() still emits the retired V3
+ * wrapper shape { kind: 'plugin', plugin: 'compact' }. A DSH ≥0.1.7 v4
+ * persistence writer rejects that shape in producer-kind admission ("format
+ * v4 message requires a producer-owned source kind") and the WHOLE write batch
+ * wedges in memory — every later event piles behind the poison row until
+ * restart (issue #181; #165 fixed our own writers but not this host-supplied
+ * one). Normalize exactly that legacy shape when the session is persisted at
+ * format v4 — header.version decides which writer encodes the row, not which
+ * package resolved — and pass everything else through verbatim: older hosts
+ * still speak the wrapper, and newer dsh-compaction copies already emit the
+ * producer kind.
+ *
+ * Removal gate: delete once the peer floor moves past the last
+ * wrapper-emitting dsh-compaction line (or upstream retires the shape there).
+ *
+ * Reachability is line-dependent, and so is its coverage: each dsh-compaction
+ * line derives its `CompactionCheckpointSource` type from its OWN marker
+ * constant, so the wrapper variant is present in the 0.1.5-line types (whose
+ * `compactCheckpointSource()` really does emit it) and absent from the 0.2.0-line
+ * ones (marker `{ kind: 'compact-checkpoint' }`). On the 0.2.0 baseline the
+ * rewrite below is therefore unreachable — and untypeable if written as a plain
+ * `source.kind === 'plugin'` comparison (TS2367 against a literal kind) — which is
+ * why the two identifying fields are read through a structural view and the
+ * normalized object is rebuilt from the fields both lines share.
+ */
+export function checkpointSourceFor(
+  session: Pick<Session, 'header'>,
+  compactionId: CompactionId,
+) {
+  const source = compactCheckpointSource(compactionId)
+  // Structural probe: never compare against `source.kind` directly (see above).
+  const shape: { readonly kind?: string; readonly plugin?: string } = source
+  if (shape.kind !== 'plugin' || shape.plugin !== 'compact') return source
+  // header.version is typed as a per-line literal (3 on the devDep line); widen
+  // through Number so this comparison compiles against both type lines.
+  if (Number(session.header.version) < 4) return source
+  // Rebuild from the known fields instead of dropping `kind`/`plugin` out of a
+  // spread: the wrapper's own `plugin` member is exactly what a v4 writer
+  // rejects, and rebuilding keeps `compactionId`/`sourceCommandId` typed by the
+  // resolved copy rather than widened.
+  const { compactionId: id, sourceCommandId } = source
+  return Object.freeze({
+    kind: 'compact-checkpoint' as const,
+    compactionId: id,
+    ...(sourceCommandId === undefined ? {} : { sourceCommandId }),
+  })
+}
+
+/**
  * Run one durable compression transaction. Throws on invalid state; on success
  * the four events are in the log and the surface has one summary node.
  */
@@ -452,6 +551,20 @@ export function runCompactionTransaction(
       + 'tool/result events); consult acp_status for the current surface range',
     )
   }
+  // The log-presence check above passes for edges an EARLIER transaction already
+  // shadowed (the append-only log keeps them forever), so it cannot stop a
+  // duplicate/stale span. The readers' load-time invariant demands more: the
+  // declared shadowedSeqs must equal the CURRENT surface slice positionally.
+  // Enforce it here, before any durable event exists, so a stale span fails as
+  // a clean zero-write error instead of leaving a dead transaction that bricks
+  // the whole session log (issue #201).
+  if (!isExactSurfaceSpan(session, input.start, input.end, input.shadowedSeqs)) {
+    throw new Error(
+      `billion-context-dsh: seq ${input.start}..${input.end} is not an exact current surface span — `
+      + 'its edges are no longer on the surface or the declared shadowedSeqs do not match the live slice. '
+      + 'Nothing was written; consult acp_status for the current surface range',
+    )
+  }
 
   try {
     seqs.push(session.append('compaction/start', { compactionId, turn }).seq)
@@ -475,7 +588,13 @@ export function runCompactionTransaction(
     // B1: frame the model-written summary ONCE at creation and write the SAME framed
     // blocks to both the durable compaction/summary event and the checkpoint node
     // below — log readers (search, acp_status, ledger) must never see different text
-    // than what the model sees in context (review item: prefix/raw mismatch).
+    // than what the model sees in context (review item: prefix/raw mismatch). The
+    // engine-written emergency overflow marker opts out (`framed: false`): it is
+    // not model-written, so the provenance prefix would mislabel it.
+    // Engine-written summaries (the overflow marker) stay unframed because
+    // `withSummaryFramePrefix` recognizes them by content — one rule shared with
+    // the projection net in src/messages.ts, so what the model sees and what the
+    // decompress header reads back are the same bytes.
     const framedSummary = prefixSummaryBlocks(input.summary)
     seqs.push(session.append('compaction/summary', {
       compactionId,
@@ -493,7 +612,9 @@ export function runCompactionTransaction(
     // idempotent safety net for legacy blocks written before this feature.
     const message = createUserMessage({
       content: framedSummary,
-      source: compactCheckpointSource(compactionId),
+      // Normalized for v4 writers when the resolved dsh-compaction copy still
+      // emits the retired wrapper shape (issue #181); verbatim otherwise.
+      source: checkpointSourceFor(session, compactionId),
     })
     // The replace op MUST use the 0.1.5 field names: dsh-session's validator
     // accepts exactly { op, startSeq, endSeq } (exactly three keys) and rejects
@@ -537,9 +658,10 @@ function summarySeqIndex(events: readonly SessionEvent[]): Map<string, number> {
   const index = new Map<string, number>()
   for (const event of events) {
     if (event.type !== 'user/message') continue
-    const source = (event.data as { source?: { plugin?: string; compactionId?: string } }).source
-    const compactionId = source?.plugin === 'compact' ? source.compactionId : undefined
-    if (compactionId !== undefined && !index.has(compactionId)) index.set(compactionId, event.seq)
+    // Both host checkpoint shapes (issue #168) — the shared extractor keeps
+    // this index and the classifier from drifting apart.
+    const compactionId = checkpointCompactionIdOf(event)
+    if (compactionId !== null && !index.has(compactionId)) index.set(compactionId, event.seq)
   }
   return index
 }
@@ -622,7 +744,19 @@ export interface SeqCompressibleRange {
   readonly tokens: number
   /** Share of messages that are tool messages (tool-call or tool-result), 0-100 — kernel `toolPct` parity. */
   readonly toolPct: number
+  /** Image blocks reachable inside the span (directly or through a tool result). */
+  readonly images: number
+  /** File blocks reachable inside the span. */
+  readonly files: number
 }
+
+/**
+ * Per-seq provider-anchored price for non-text blocks (see `mediaPriceViaMeter`
+ * in host-tokens.ts). A callback, not a map, so a media-free session never pays
+ * for a meter measurement: the range walk only asks about seqs it already knows
+ * carry an image/file block.
+ */
+export type MediaPriceOf = (seq: number) => number
 
 /** Whether a surface message event is a tool message (tool-call or tool-result) — kernel `isToolMessage` parity. */
 function isToolEvent(event: SessionEvent): boolean {
@@ -635,9 +769,9 @@ function isToolEvent(event: SessionEvent): boolean {
 // `isCheckpointNode` now lives in src/messages.ts (imported above) so the range
 // scanner, the protected-tail scan and `classifySurfaceEvent` cannot drift
 // apart. A local `isPruneTombstone` was dropped for the same reason: the prune
-// tombstone carries the `billion-context-dsh` producer kind (see
-// `hideSurfaceSeqs`), which `classifySurfaceEvent` files under `metadata`, so
-// `isRealUserTurn` already refuses it tail protection.
+// tombstone is written with `source: { kind: 'plugin:billion-context-dsh' }`
+// (see `hideSurfaceSeqs`), which `classifySurfaceEvent` files under `metadata`,
+// so `isRealUserTurn` already refuses it tail protection.
 
 /**
  * Whether a surface node is a host-owned system prompt (`system/message`, new
@@ -673,11 +807,12 @@ function toolCallIdsOfEvent(event: SessionEvent): string[] {
  * every hidden span becomes a user message. Callers with meaningful text pass
  * it (compress call/result hiding keeps the tool outcome visible to the
  * model); callers without get the fixed prune note. The originals remain in
- * the append-only log.
+ * the append-only log. Exported for the issue #201 regression tests — not part
+ * of the public API (index.ts re-exports only).
  */
 export const PRUNE_NOTE = '(removed by context management)'
 
-function hideSurfaceSeqs(
+export function hideSurfaceSeqs(
   session: Session,
   seqs: readonly number[],
   text?: string,
@@ -686,6 +821,15 @@ function hideSurfaceSeqs(
   if (seqs.length === 0) return
   const start = seqs[0]!
   const end = seqs[seqs.length - 1]!
+  // Readers enforce the same exact-span invariant on compaction/prune as on
+  // compaction/summary, so a dangling prune bricks the log exactly like a dead
+  // transaction. Validate BEFORE the first append (issue #201).
+  if (!isExactSurfaceSpan(session, start, end, seqs)) {
+    throw new Error(
+      `billion-context-dsh: cannot prune seqs ${seqs.join(', ')} — they do not name an exact current surface span. `
+      + 'Nothing was written; consult acp_status for the current surface range',
+    )
+  }
   let shadowedTokenCount = 0
   for (const seq of seqs) {
     const event = eventAtOf(session, seq)
@@ -702,7 +846,10 @@ function hideSurfaceSeqs(
   const body = text !== undefined && text.trim().length > 0 ? text : PRUNE_NOTE
   session.append('user/message', createUserMessage({
     content: [{ type: 'text', text: body }],
-    source: engineSource('billion-context-dsh', 'prune-tombstone'),
+    // V4 producer kind (issue #163): DSH ≥0.1.7's V4 admission rejects the
+    // legacy wrapper `{ kind: 'plugin', plugin: … }`; `plugin:<name>` is what
+    // the host's own V3→V4 migration emits and is accepted by 0.1.5 too.
+    source: { kind: 'plugin:billion-context-dsh' },
   }), {
     surfaceOp: { op: 'replace', startSeq: start as SurfaceSeq, endSeq: end as SurfaceSeq },
     sourceEventSeqs: [...seqs] as SurfaceSeq[],
@@ -952,28 +1099,66 @@ export function newestInstructionSeqsOf(session: Session): Set<number> {
 }
 
 /**
+ * Newest skill-catalog row (issue #185). ONE group: every catalog row is the
+ * full current list, so each new one supersedes all earlier ones (unlike
+ * agent-instructions, which group per file scope). The guard matters because
+ * the host does NOT re-inject a folded catalog — dsh-tool-skill's resend gate
+ * is the catalog DIGEST, and shadowing the visible row changes nothing about
+ * it, so the model loses skill discovery until the catalog actually changes.
+ * Tail-scan the log like newestInstructionSeqsOf; null when the session never
+ * carried a catalog.
+ */
+export function newestSkillCatalogSeqOf(session: Session): number | null {
+  const events = sessionEventsOf(session)
+  for (let seq = events.length - 1; seq >= 0; seq -= 1) {
+    const event = events[seq]
+    if (event !== undefined && isSkillCatalogRow(event)) return seq
+  }
+  return null
+}
+
+/**
  * Surface seqs NO caller may compress: the CURRENT (newest) injected
- * agent-instructions row of every scope, restricted to rows still visible on
- * the surface (one definition of "current" — `newestInstructionSeqsOf`).
- * `buildCompressibleSeqRanges` never OFFERS them, and both compress entry
- * points (`handleCompress` in src/tools.ts, `/acp compress` in
- * src/commands.ts) probe the RESOLVED span against this set and HARD-REJECT a
- * covering range before the kernel applies it, so nothing durable lands and no
- * phantom block can exist. This supersedes the earlier F7 draft (warn only):
- * folding a current copy reclaims nothing — the host re-injects it — so there
- * is no legitimate outcome to warn about. Deliberately NARROW (issue #71
- * review F4): only CURRENT agent-instructions rows — the audited loop driver.
- * Engine-authored metadata rows (nudge echo, compress-pair stub) stay
- * foldable like main, and STALE copies of the same file stay compressible —
- * removing them while the newest copy stays visible is the real cleanup.
+ * agent-instructions row of every scope (restricted to rows still visible on
+ * the surface — one definition of "current" — `newestInstructionSeqsOf`) PLUS
+ * the newest visible REAL user turn (`isRealUserTurn` reverse scan over
+ * `session.surface.nodes`, issue #196): a wide or miscalculated model span
+ * must never shadow the active question, while OLDER user turns stay
+ * compressible once superseded by a newer one. `buildCompressibleSeqRanges`
+ * never OFFERS them, and both compress entry points (`handleCompress` in
+ * src/tools.ts, `/acp-prune compress` in src/commands.ts) probe the RESOLVED
+ * span against this set and HARD-REJECT a covering range before the kernel
+ * applies it, so nothing durable lands and no phantom block can exist. This
+ * supersedes the earlier F7 draft (warn only): folding a current copy reclaims
+ * nothing — the host re-injects it — and folding the active user turn loses the
+ * conversation intent, so neither has a legitimate outcome to warn about.
+ * Deliberately NARROW (issue #71 review F4): for instruction rows, only CURRENT
+ * ones — the audited loop driver; for skill catalogs (issue #185) it is the ONE
+ * visible copy, because unlike AGENTS.md the host does NOT re-send a folded
+ * catalog (resend is keyed on the digest, which a fold cannot change), so
+ * folding it loses skill discovery until the catalog actually changes.
+ * Engine-authored metadata rows (nudge echo, compress-pair stub) stay foldable
+ * like main, and STALE copies (older AGENTS.md scopes, superseded catalog rows)
+ * stay compressible — removing them while the newest copy stays visible is the
+ * real cleanup.
  */
 export function guardedSurfaceSeqsOf(session: Session): Set<number> {
   const guarded = new Set<number>()
   const newestInstructions = newestInstructionSeqsOf(session)
+  const newestCatalog = newestSkillCatalogSeqOf(session)
   for (const seq of session.surface.nodes) {
     const event = eventAtOf(session, seq)
     if (event === undefined) continue
     if (isAgentInstructionsRow(event) && newestInstructions.has(seq)) guarded.add(seq)
+    else if (newestCatalog !== null && seq === newestCatalog) guarded.add(seq)
+  }
+  for (let index = session.surface.nodes.length - 1; index >= 0; index -= 1) {
+    const seq = session.surface.nodes[index]!
+    const event = eventAtOf(session, seq)
+    if (event !== undefined && isRealUserTurn(event)) {
+      guarded.add(seq)
+      break
+    }
   }
   return guarded
 }
@@ -998,8 +1183,11 @@ function seqOfKernelRef(refs: KernelRangeView['refs'], ref: string): number | nu
   const id = refs.byRef[ref]
   if (id === undefined) return null
   // Our CoreMessage ids ARE surface seqs (src/messages.ts), so the kernel's ref
-  // map is the bridge between the two id dialects.
-  const seq = Number(id)
+  // map is the bridge between the two id dialects. Multi-tool-call messages
+  // project to `${seq}#${callId}` sub-ids (issue #155) — strip the suffix so a
+  // kernel range bounded by such a sub-id still resolves to its surface node
+  // instead of silently vanishing from the nudge table.
+  const seq = Number(String(id).split('#')[0])
   return Number.isInteger(seq) ? seq : null
 }
 
@@ -1013,7 +1201,10 @@ function seqOfKernelRef(refs: KernelRangeView['refs'], ref: string): number | nu
  * - the last REAL user turn (never an injected row — see `isRealUserTurn`);
  * - the newest instruction row of every scope: the host re-injects the current
  *   copy of an instruction file the moment it disappears from the surface, so
- *   folding it reclaims nothing (rule 16).
+ *   folding it reclaims nothing (rule 16);
+ * - the newest skill-catalog row: the host never re-sends a folded catalog
+ *   (resend keyed on the digest), so the visible copy must stay on the
+ *   surface (issue #185).
  */
 function protectedSurfaceSeqs(session: Session, preserve: number): Set<number> {
   const nodes = session.surface.nodes
@@ -1038,6 +1229,10 @@ function protectedSurfaceSeqs(session: Session, preserve: number): Set<number> {
     }
   }
   for (const seq of newestInstructionSeqsOf(session)) protectedSeqs.add(seq)
+  // Belt-and-braces alongside the classifier barrier: a catalog row must stay
+  // out of every offered range even if its shape recognition regresses.
+  const newestCatalog = newestSkillCatalogSeqOf(session)
+  if (newestCatalog !== null) protectedSeqs.add(newestCatalog)
   return protectedSeqs
 }
 
@@ -1048,6 +1243,8 @@ interface CompressibleSegment {
   count: number
   tokens: number
   toolCount: number
+  images: number
+  files: number
 }
 
 /**
@@ -1066,6 +1263,7 @@ function compressibleSegmentsOf(
   fromIndex: number,
   toIndex: number,
   protectedSeqs: ReadonlySet<number>,
+  mediaPriceOf?: MediaPriceOf,
 ): CompressibleSegment[] {
   const nodes = session.surface.nodes
   const segments: CompressibleSegment[] = []
@@ -1099,16 +1297,38 @@ function compressibleSegmentsOf(
       flush()
       continue
     }
-    const tokens = defaultCountTokens(extractEventText(event))
+    // Text is priced with the kernel's CJK-aware counter; image/file blocks add
+    // a media price on top, because no text estimator can see them and a span
+    // that looked free was ranked last by the model (issue #117). The routed
+    // surcharge (meter) and the fixed structural estimate (host heuristic) are
+    // ADDED: the meter reports no surcharge at all on every adapter that
+    // declares no visual price, and an absent surcharge must never make a
+    // picture look free. The callback is only consulted for a seq that really
+    // carries an attachment.
+    const attachments = attachmentsOfEvent(event)
+    const mediaPrice = attachments.images + attachments.files > 0
+      ? (mediaPriceOf?.(seq) ?? 0) + hostMediaStructuralPrice(mediaBlocksOfEvent(event))
+      : 0
+    const tokens = defaultCountTokens(extractEventText(event)) + mediaPrice
     const isTool = isToolEvent(event)
     if (current === null) {
-      current = { start: seq, end: seq, count: 1, tokens, toolCount: isTool ? 1 : 0 }
+      current = {
+        start: seq,
+        end: seq,
+        count: 1,
+        tokens,
+        toolCount: isTool ? 1 : 0,
+        images: attachments.images,
+        files: attachments.files,
+      }
     } else {
       current.start = Math.min(current.start, seq)
       current.end = Math.max(current.end, seq)
       current.count += 1
       current.tokens += tokens
       current.toolCount += isTool ? 1 : 0
+      current.images += attachments.images
+      current.files += attachments.files
     }
   }
   flush()
@@ -1147,7 +1367,7 @@ function compressibleSegmentsOf(
 export function buildCompressibleSeqRanges(
   session: Session,
   kernelView: KernelRangeView,
-  opts: { preserveRecent?: number } = {},
+  opts: { preserveRecent?: number; mediaPriceOf?: MediaPriceOf } = {},
 ): SeqCompressibleRange[] {
   // Orphan tool messages corrupt the pairing balance cache and fragment every
   // large span. Prune them before mapping so the table reflects the surface
@@ -1166,7 +1386,13 @@ export function buildCompressibleSeqRanges(
     const from = startSeq === null ? undefined : indexOfSeq.get(startSeq)
     const to = endSeq === null ? undefined : indexOfSeq.get(endSeq)
     if (from === undefined || to === undefined) continue
-    const segments = compressibleSegmentsOf(session, Math.min(from, to), Math.max(from, to), protectedSeqs)
+    const segments = compressibleSegmentsOf(
+      session,
+      Math.min(from, to),
+      Math.max(from, to),
+      protectedSeqs,
+      opts.mediaPriceOf,
+    )
     for (const segment of segments) {
       try {
         const { start, end } = resolveSurfaceRange(session, segment.start, segment.end)
@@ -1176,6 +1402,8 @@ export function buildCompressibleSeqRanges(
           count: segment.count,
           tokens: segment.tokens,
           toolPct: segment.count > 0 ? Math.round((segment.toolCount / segment.count) * 100) : 0,
+          images: segment.images,
+          files: segment.files,
         })
       } catch {
         // Cannot be balanced into a compressible span — skip.
@@ -1269,6 +1497,44 @@ export function blockRegistry(session: Session): AcpBlockRegistryEntry[] {
 }
 
 /**
+ * Checkpoint carriers of STILL-ACTIVE blocks inside a set of surface seqs.
+ *
+ * A plain message-ref range does not supersede a live block: the kernel keeps
+ * such a carrier visible and reports the exclusion in its warning list
+ * (upstream #335 — our projection marks carriers with
+ * `CoreMessage.summaryOfBlockId`). But our durable transaction replaces the
+ * whole span in ONE `surfaceOp`, so the carrier would leave the visible surface
+ * anyway — the block's summary would vanish while the kernel still counts the
+ * block as active, and the nudge's tier line would name a checkpoint seq that no
+ * longer exists. The compress path therefore rejects such a span (see
+ * `liveCarrierRejectionNote` in src/tools.ts).
+ *
+ * The offered range table never produces one — `compressibleSegmentsOf` flushes
+ * on every checkpoint, exactly like the instruction-row barriers — so only a
+ * hand-crafted call can reach this probe.
+ */
+export function liveCheckpointCarriersInSpan(
+  session: Session,
+  seqs: readonly number[],
+): { seq: number; kernelBlockId: string }[] {
+  const activeIds = new Map<string, string>()
+  for (const entry of blockRegistry(session)) {
+    if (entry.active) activeIds.set(entry.blockId, entry.kernelBlockId)
+  }
+  if (activeIds.size === 0) return []
+  const hits: { seq: number; kernelBlockId: string }[] = []
+  for (const seq of seqs) {
+    const event = eventAtOf(session, seq)
+    if (event === undefined || !isCheckpointNode(event)) continue
+    const compactionId = checkpointCompactionIdOf(event)
+    if (compactionId === null) continue
+    const kernelBlockId = activeIds.get(compactionId)
+    if (kernelBlockId !== undefined) hits.push({ seq, kernelBlockId })
+  }
+  return hits.sort((a, b) => a.seq - b.seq)
+}
+
+/**
  * The kernel block ref (`bN`) for a surface seq, when that seq is the
  * checkpoint summary node of a block — the edge the model must use to
  * distill (T2/T3). Active blocks distill; a stale (already-distilled) node
@@ -1278,10 +1544,11 @@ export function blockRegistry(session: Session): AcpBlockRegistryEntry[] {
  */
 export function blockRefForSummarySeq(session: Session, seq: number): string | null {
   const event = eventAtOf(session, seq)
-  if (event?.type !== 'user/message') return null
-  const source = (event.data as { source?: { plugin?: string; compactionId?: string } }).source
-  if (source?.plugin !== 'compact' || source.compactionId === undefined) return null
-  const entry = blockRegistry(session).find((r) => r.blockId === source.compactionId)
+  if (event === undefined) return null
+  // Both host checkpoint shapes (issue #168) via the shared extractor.
+  const compactionId = checkpointCompactionIdOf(event)
+  if (compactionId === null) return null
+  const entry = blockRegistry(session).find((r) => r.blockId === compactionId)
   if (entry === undefined) return null
   return entry.kernelBlockId
 }
@@ -1318,10 +1585,9 @@ export function summarySeqOfKernelBlock(session: Session, kernelBlockId: string)
 /** The durable block whose checkpoint node sits at `seq` (or null). */
 function checkpointBlockIdOf(events: readonly SessionEvent[], seq: number): string | null {
   const event = events[seq]
-  if (event?.type !== 'user/message') return null
-  const source = (event.data as { source?: { plugin?: string; compactionId?: string } }).source
-  if (source?.plugin !== 'compact' || source.compactionId === undefined) return null
-  return source.compactionId
+  if (event === undefined) return null
+  // Both host checkpoint shapes (issue #168) via the shared extractor.
+  return checkpointCompactionIdOf(event)
 }
 
 /**

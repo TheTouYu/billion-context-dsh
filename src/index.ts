@@ -21,7 +21,7 @@
  * ```
  *
  * The package registers `ctx.compaction` plus the four model tools and the
- * `/acp` command when the hosting composition provides `ctx.tools` /
+ * `/acp-prune` command when the hosting composition provides `ctx.tools` /
  * `ctx.commands`.
  * @module billion-context-dsh
  */
@@ -37,24 +37,40 @@ import {
 } from '@deepseek-ai/dsh-compaction'
 import { createCore, setDocCacheCap, type CompressionCore } from 'acp-kernel'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { SettingsService } from './settings.ts'
+import type { Session } from '@deepseek-ai/dsh-session'
+import { CONTEXT_WINDOW_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm'
 import { DEFAULT_SESSION_CACHE_LIMIT, LruMap } from './lru.ts'
 import { AcpStateStore } from './state.ts'
 import { makeTools, type ToolEnvironment } from './tools.ts'
 import { acpCommand } from './commands.ts'
-import { buildNudge, EMERGENCY_NUDGE_MAX_PER_TURN } from './nudge.ts'
+import { buildNudge, EMERGENCY_NUDGE_MAX_PER_TURN, meterMediaPriceResolver, resolveTokenCount } from './nudge.ts'
 import { ACP_SYSTEM_PROMPT_ORDER } from './system-prompt.ts'
 import { renderSystemPrompt, resolvePrompts, type AcpPrompts, type ResolvedPrompts } from './prompts.ts'
 import { DEFAULT_CONTEXT_WINDOW, probeModelWindow, projectedContextWindow, routeFor, type AcpWindow } from './window.ts'
-import { deferCompressPairHide, stripOrphanedSurfaceToolMessages } from './region.ts'
+import {
+  buildCompressibleSeqRanges,
+  deferCompressPairHide,
+  runCompactionTransaction,
+  shadowedSeqsOf,
+  stripOrphanedSurfaceToolMessages,
+  type KernelRangeView,
+} from './region.ts'
+import { allLogMessages, eventsToCoreMessages, overflowMarkerSummary, surfaceEventsOf, toolCallIdOfResultEvent } from './messages.ts'
+import { shadowedTokensViaMeter } from './host-tokens.ts'
+import { kernelConfigFor } from './config.ts'
 import {
   ACP_SETTINGS_NAMESPACE,
+  AcpPluginConfigSchema,
   AcpSettingsSchema,
   describeSettingsChange,
   filterSettingsEntry,
+  liveSettingsFromRefs,
   makeSettingsCommandSurface,
   resolveAcpSettings,
   type AcpSettings,
+  type AcpSettingsInput,
+  type AcpSettingsService,
+  type LegacySettingsService,
   type SettingsCommandSurface,
 } from './settings.ts'
 import { PRESETS, PRESET_NAMES, isPresetName, resolvePreset, type NudgePreset, type PresetName } from './presets.ts'
@@ -116,16 +132,24 @@ export {
 export { eventsToCoreMessages, projectEvent, surfaceEventsOf, extractEventText } from './messages.ts'
 export {
   ACP_SETTINGS_NAMESPACE,
+  AcpPluginConfigSchema,
   AcpSettingsSchema,
   describeSettingsChange,
   filterSettingsEntry,
+  isVolatileRef,
+  liveSettingsFromRefs,
   makeSettingsCommandSurface,
   parseSettingValue,
   resolveAcpSettings,
   SETTINGS_KEYS,
   SETTING_DEFAULTS,
+  unwrapVolatile,
+  VOLATILE_WRITE,
   type AcpSettings,
+  type AcpSettingsDescriptor,
   type AcpSettingsInput,
+  type AcpSettingsService,
+  type LegacySettingsService,
   type SettingsChangeEffect,
   type SettingsCommandSurface,
   type SettingsKey,
@@ -195,10 +219,19 @@ export interface AcpConfig {
   readonly countTokens?: (text: string) => number
   /** Register the four model tools on `ctx.tools`. Default true. */
   readonly autoTools: boolean
-  /** Register the `/acp` command on `ctx.commands`. Default true. */
+  /** Register the `/acp-prune` command on `ctx.commands`. Default true. */
   readonly autoCommand: boolean
   /** Inject the nudge into `agent/pre-step` when the kernel recommends it. Default true. */
   readonly autoNudge: boolean
+  /**
+   * How many consecutive provider-confirmed context-overflow failures one
+   * agent may answer with an emergency compaction + retry before the original
+   * error is preserved (mirrors compaction-basic's `maxOverflowRetries`;
+   * default 1, the host's own default). The budget resets when the agent
+   * makes progress (an assistant message lands) or returns to idle, so a
+   * request that cannot be repaired cannot retry forever.
+   */
+  readonly maxOverflowRetries?: number
   /**
    * Escape hatch: disable the runtime-settings integration entirely
    * (composition-layer ONLY — deliberately not exposed through the settings
@@ -215,6 +248,9 @@ const DEFAULT_CONFIG: AcpConfig = {
   autoTools: true,
   autoCommand: true,
   autoNudge: true,
+  // Same default as the host's compaction-basic policy: one owned retry per
+  // unrelieved overflow, then the original error is preserved.
+  maxOverflowRetries: 1,
   // Nudge thresholds: engine defaults 0.70/0.85 — deliberately below the
   // kernel/billion-context-pi 0.75/0.95. 0.95 leaves no room to act before
   // the API rejects, and the host's compaction-basic line (thresholdRatio
@@ -229,7 +265,15 @@ const DEFAULT_CONFIG: AcpConfig = {
 export function resolveAcpConfig(config: Partial<AcpConfig> = {}): AcpConfig {
   const resolved = resolvePresetThresholds({ ...DEFAULT_CONFIG, ...config }, config)
   assertNudgeThresholdOrder(resolved)
-  return resolved
+  const maxOverflowRetries = resolved.maxOverflowRetries ?? 1
+  if (!Number.isInteger(maxOverflowRetries) || maxOverflowRetries < 0) {
+    throw new Error(`maxOverflowRetries must be a non-negative integer (got ${maxOverflowRetries})`)
+  }
+  // Write the validated value BACK: an explicit `maxOverflowRetries: undefined`
+  // in a Partial config survives the `{ ...DEFAULT_CONFIG, ...config }` spread
+  // as `undefined`, and the request-error listener must never read that as
+  // "budget 0" (recovery silently disabled while the config says default).
+  return { ...resolved, maxOverflowRetries }
 }
 
 /**
@@ -249,6 +293,35 @@ function resolvePresetThresholds(base: AcpConfig, config: Partial<AcpConfig>): A
   // while letting the preset fill anything the caller left unset.
   return {
     ...base,
+    nudgeMinContextLimitPct: config.nudgeMinContextLimitPct ?? preset.nudgeMinContextLimitPct,
+    nudgeMaxContextLimitPct: config.nudgeMaxContextLimitPct ?? preset.nudgeMaxContextLimitPct,
+    nudgeEmergencyThresholdPct: config.nudgeEmergencyThresholdPct ?? preset.nudgeEmergencyThresholdPct,
+  }
+}
+
+/**
+ * The settings-layer view of the RAW composition row: its six scalar knobs,
+ * plus — when the row names a preset — the preset values for the thresholds
+ * the row leaves unset.
+ *
+ * Every kernel consumer reads those six knobs through `readSettingsSource()`,
+ * never from `this.config` (where `resolveAcpConfig` already applied the
+ * preset). Seeding the live snapshot and the seam's base layer from the raw
+ * row alone would therefore drop the preset entirely: a preset-only row
+ * (`{ preset: 'aggressive' }`) resolves to `{}` there, and the schema
+ * defaults (0.70 / 0.85) silently win — issue #176. Filling the absent
+ * thresholds with the preset's values keeps explicit > preset > default on
+ * the live read path exactly as on `this.config` (only ABSENT keys are
+ * filled, so an explicit value on the row still outranks its preset).
+ */
+function presetFilledSettingsEntry(config: Partial<AcpConfig>): AcpSettingsInput {
+  const entry = filterSettingsEntry(config)
+  if (config.preset === undefined) return entry
+  // Safe to re-resolve: an unknown name already threw in resolveAcpConfig,
+  // which runs earlier in the same constructor.
+  const preset = resolvePreset(config.preset)
+  return {
+    ...entry,
     nudgeMinContextLimitPct: config.nudgeMinContextLimitPct ?? preset.nudgeMinContextLimitPct,
     nudgeMaxContextLimitPct: config.nudgeMaxContextLimitPct ?? preset.nudgeMaxContextLimitPct,
     nudgeEmergencyThresholdPct: config.nudgeEmergencyThresholdPct ?? preset.nudgeEmergencyThresholdPct,
@@ -286,12 +359,31 @@ function assertNudgeThresholdOrder(config: AcpConfig): void {
   }
 }
 
+/** One emergency context-overflow compaction, for the recovery log line. */
+interface OverflowRecoveryResult {
+  readonly start: number
+  readonly end: number
+  readonly shadowedSeqs: readonly number[]
+  readonly shadowedTokenCount: number
+}
+
 /**
  * The ACP compaction backend. Subclasses the seam exactly like
  * `dsh-compaction-basic`; swaps summarization-driven compaction for
  * model-driven block compression without touching the agent loop.
  */
 export class AcpCompactionEngine extends CompactionEngine {
+  /**
+   * Static plugin config schema — cordis reads `plugin.Config` off the raw
+   * plugin value at fiber start and validates the composition row against it
+   * (`resolveConfig`). Class-shaped mounts carry this (the bundle/composition
+   * row path); function-shaped mounts skip validation and receive plain
+   * values. On dsh-settings ≥ 0.1.7 hosts this SAME schema is what SettingsForms
+   * builds its form from — the volatile fields are exactly what `/acp-prune
+   * config` exposes (see AcpPluginConfigSchema for why fields are volatile and
+   * default-free).
+   */
+  static readonly Config = AcpPluginConfigSchema
   /** The framework-agnostic ACP compression core, reused verbatim. */
   readonly kernel: CompressionCore
   /** Per-session kernel state. */
@@ -316,17 +408,27 @@ export class AcpCompactionEngine extends CompactionEngine {
   private readonly compressCallIdsToHide = new Set<string>()
   /** Per provider/model route the resolved window (probe failures cached too). */
   private readonly windowCache = new Map<string, AcpWindow>()
-  /** Live settings snapshot thunk (composition → user settings layer); swapped when the settings provider attaches (SettingsProvider.installSection). */
+  /** Live settings snapshot thunk (composition → user settings layer); swapped when the settings provider attaches (installSection on ≤0.1.6 lines, volatile-ref re-read on the ≥0.1.7 forms line). */
   private readSettingsSource: () => AcpSettings = () => resolveAcpSettings({})
-  /** The settings service, captured lazily for /acp config (undefined in provider-less processes). */
-  private settingsService: SettingsService | undefined
-  /** /acp config read/write surface. */
+  /** Hot-apply driver: re-reads the live source and runs the change diff; called once per agent step, a no-op unless something changed. */
+  private resyncSettings: () => void = () => {}
+  /** The settings service, captured lazily for /acp-prune config (undefined in provider-less processes). Structurally typed — both host lines' real services satisfy it. */
+  private settingsService: AcpSettingsService | undefined
+  /** /acp-prune config read/write surface. */
   readonly settingsCommand: SettingsCommandSurface
   /** Per route the adapter's per-request output cap (the output reservation); null = undisclosed. */
   private readonly outputReservationCache = new Map<string, number | null>()
+  /** Per-agent context-overflow recovery budget (mirrors the host's `overflowRetries`). */
+  private readonly overflowRetries = new Map<Agent, number>()
+  /** Per-session overflow agents, so session progress can reset the recovery budget. */
+  private readonly overflowSessions = new Map<Session, Agent>()
   constructor(ctx: Context, config: Partial<AcpConfig> = {}) {
     super(ctx)
-    this.config = resolveAcpConfig(config)
+    // Class-mounted compositions arrive with the six knobs wrapped in volatile
+    // refs (the loader resolves our static Config schema before construction);
+    // unwrap them so preset resolution, the threshold-order assertion and the
+    // config snapshot see plain values, not opaque objects.
+    this.config = resolveAcpConfig({ ...config, ...liveSettingsFromRefs(filterSettingsEntry(config)) })
     // Resolve + validate prompt templates BEFORE building env: a template typo
     // must fail engine construction, never silently leak into model context.
     this.prompts = resolvePrompts(config.prompts)
@@ -351,21 +453,42 @@ export class AcpCompactionEngine extends CompactionEngine {
     // The six settings-exposed knobs resolve as: schema default → composition
     // row subset (FILTERED — a raw row also carries prompts/coreOverrides/
     // countTokens, values that must never enter the settings layer) → the
-    // user's settings.yaml section. `current` is the live snapshot every
-    // consumer reads; `applySettings` lands an incoming change (initial call
-    // included) and runs the diff handler. The integration is an
+    // host's user layer (~/.dsh/settings.yaml section on the legacy line,
+    // profile entry config on the forms line). `current` is the live snapshot
+    // every consumer reads; `applySettings` lands an incoming change (initial
+    // call included) and runs the diff handler. The integration is an
     // OPTIONAL-service consumer: with no settings provider (plain npm-install
     // compositions) nothing registers and the engine behaves exactly as
     // composed — the same values, read through the same thunk.
     // The BASE layer the seam registers is the composition row's own scalar
     // subset, taken from the RAW row — not from `this.config`, which already has
     // engine defaults merged in; using it would turn every uncomposed key into a
-    // `base` override that shadows the schema default (so /acp config list would
+    // `base` override that shadows the schema default (so /acp-prune config list would
     // report `base` for keys nobody composed, and a reset would keep the value).
-    // `current` is the resolved snapshot reads start from; the two differ only
-    // in which keys are PRESENT, never in the values they resolve to.
-    const compositionEntry = filterSettingsEntry(config)
-    let current: AcpSettings = resolveAcpSettings(compositionEntry)
+    // One deliberate exception (issue #176): when the row names a preset, the
+    // preset values for the thresholds the row leaves unset ARE added — every
+    // kernel consumer reads the six knobs through `readSettingsSource()`, never
+    // `this.config`, so without them a preset-only row resolves to `{}` here
+    // and the schema defaults (0.70 / 0.85) silently win. Consequence: for a
+    // composed preset, /acp-prune config list attributes those threshold keys to
+    // `base` and a runtime reset falls back to the preset value, not the
+    // engine default. `current` is the resolved snapshot reads start from; the
+    // two differ only in which keys are PRESENT, never in the values they
+    // resolve to.
+    // On hosts whose loader validates our static Config schema (class-mounted
+    // compositions), row values arrive wrapped in volatile refs — unwrap them
+    // for one-shot reads, and keep the RAW filtered entry so the forms path can
+    // re-read through those refs live (form writes commit into them in place).
+    const compositionEntry = presetFilledSettingsEntry(config)
+    // Construction-time snapshot — what "behaves exactly as composed" means.
+    // Detach falls back to THIS, never to the mutable `current`: on the
+    // legacy line the provider's own dispose hook resets the source to the
+    // registered entry (which resolves to exactly these values), and on the
+    // forms line the service dies while the last-applied values may no longer
+    // be editable through any live surface — stranding them would be worse
+    // than reverting to the composition.
+    const initialCurrent: AcpSettings = resolveAcpSettings(liveSettingsFromRefs(compositionEntry))
+    let current: AcpSettings = initialCurrent
     this.readSettingsSource = () => current
     const engine = this
     const applySettings = (): void => {
@@ -381,51 +504,104 @@ export class AcpCompactionEngine extends CompactionEngine {
         this.ctx.logger.warn(`billion-context-dsh: applying settings change failed: ${String(error)}`)
       }
     }
+    this.resyncSettings = applySettings
     this.settingsCommand = makeSettingsCommandSurface(() => this.settingsService, () => current)
+    // Detach cleanup shared by both supported paths: cordis disposes the value
+    // an inject callback returns when the provider fiber unloads. Without it
+    // the engine keeps a dead provider handle (/acp-prune config would still
+    // report available and write into a disposed service). Reads fall back to
+    // the CONSTRUCTION-TIME snapshot, not the mutable `current`: on the legacy
+    // line the provider's own dispose hook resets the source to the registered
+    // entry (which resolves to exactly these values), and on the forms line
+    // freezing at whatever was last applied could strand values the operator
+    // can no longer edit through any live surface. Order-independent either way.
+    const detachSettings = (): void => {
+      this.settingsService = undefined
+      this.readSettingsSource = () => initialCurrent
+    }
     if (this.config.settingsEnabled !== false) {
-      // The seam's consumer entry point is `SettingsProvider.installSection` —
-      // a METHOD on the provider as of the 0.1.5 line (the standalone
-      // `installSettingsSection` helper this was written against is gone).
-      // It registers the composition-row subset as the base layer while a
-      // provider is attached and swaps the source thunk when the provider
-      // mounts. The detach side is OURS (the disposer below): once the provider
-      // is gone the seam hands no source back, so without it the engine would
-      // keep reading the last published value and later settings.yaml edits
-      // would silently stop applying.
+      // Two supported host shapes, detected at runtime (issue #193): the
+      // ≤0.1.6 lines expose the legacy `installSection` section seam (the
+      // standalone `installSettingsSection` helper this was written against
+      // is gone — it is now a method on the provider); the ≥0.1.7 lines
+      // expose SettingsForms, which builds its form from our static Config
+      // schema and has no registration step at all. A settings-shaped
+      // service speaking neither degrades with one warn (issue #173).
       ctx.inject(['settings'], (settingsCtx) => {
-        // 0.1.7 removed the namespace seam: the service is `SettingsForms` there and has
-        // no `installSection`, because a plugin's own Config *is* its settings. The row's
-        // config already supplies every value — the same source this engine reads whenever
-        // no provider is attached — so skip registration and keep the live service for
-        // `/acp config`. Guarded at runtime so one source deploys on both lines.
-        if (typeof (settingsCtx.settings as unknown as { installSection?: unknown }).installSection !== 'function') {
-          this.settingsService = settingsCtx.settings
-          return () => {
-            this.settingsService = undefined
+        // The service handle is read structurally: the seam's Context
+        // augmentation differs per host line (and is absent whenever this
+        // package's types stop importing dsh-settings) — feature detection
+        // below only needs the runtime shape.
+        const face = (settingsCtx as unknown as { settings?: unknown }).settings
+        if (face === undefined || typeof face !== 'object') return undefined
+        const service = face as Record<string, unknown>
+        if (typeof service.installSection === 'function') {
+          // LEGACY LINE (dsh-settings ≤ 0.1.6): register the composition-row
+          // subset as the section's base layer; the provider pushes changes via
+          // onChange and swaps the source thunk. UNWRAPPED values go across the
+          // seam — volatile refs must never reach the provider's persistence
+          // (they stringify to {}).
+          const legacy = service as unknown as LegacySettingsService
+          legacy.installSection(ctx, ACP_SETTINGS_NAMESPACE, AcpSettingsSchema, liveSettingsFromRefs(compositionEntry), {
+            // The seam's source type follows the entry it registered, so `source`
+            // is a partial view of the settings; re-resolve it into a
+            // fully-defaulted snapshot so every reader sees the same shape the
+            // composition path produced.
+            setSource: (source) => {
+              this.readSettingsSource = () => resolveAcpSettings(source())
+            },
+            onChange: applySettings,
+          })
+          this.settingsService = legacy
+          return detachSettings
+        }
+        if (typeof service.describe === 'function' && typeof service.update === 'function' && typeof service.replace === 'function') {
+          // FORMS LINE (dsh-settings ≥ 0.1.7): there is no registration step —
+          // the profile entry IS the carrier (its id equals the bundle row's id),
+          // and the volatile fields of our static Config schema are exactly what
+          // its form exposes. Form writes commit into our fiber config's volatile
+          // refs IN PLACE between steps and emit no event we receive, so swap the
+          // thunk to re-read through the refs; agent/pre-step drives the diff.
+          // The host's methods read instance state through `this` — keep the
+          // original receiver (a cordis-injected face may be a proxy, and a
+          // bare reference would rebind `this` to this wrapper object).
+          this.settingsService = {
+            describe: (service.describe as AcpSettingsService['describe']).bind(service),
+            update: (service.update as AcpSettingsService['update']).bind(service),
+            replace: (service.replace as AcpSettingsService['replace']).bind(service),
           }
+          this.readSettingsSource = () => resolveAcpSettings(liveSettingsFromRefs(compositionEntry))
+          // One-shot diagnostic: the forms line addresses settings by PROFILE
+          // ENTRY ID, and we address the bundle row's id (`compaction-acp`).
+          // If the operator renamed their own composition row, no descriptor
+          // exists for us — without this warn, /acp-prune config would report
+          // available while every write fails with an opaque entry error.
+          try {
+            const rows = (service.describe as AcpSettingsService['describe']).call(service)
+            if (!rows.some((row) => String(row.ns) === ACP_SETTINGS_NAMESPACE)) {
+              this.ctx.logger.warn(
+                'billion-context-dsh: SettingsForms is present but no profile entry named "compaction-acp" is visible — '
+                + 'the six knobs keep their composition values; /acp-prune config needs a composition row with that id '
+                + '(the bundle install provides it)',
+              )
+            }
+          } catch {
+            // A throwing describe() is a host defect, not ours to repair — the
+            // command surface surfaces it loudly on first use instead.
+          }
+          return detachSettings
         }
-        settingsCtx.settings.installSection(ctx, ACP_SETTINGS_NAMESPACE, AcpSettingsSchema, compositionEntry, {
-          // The seam's source type follows the entry it registered, so `source`
-          // is a partial view of the settings; re-resolve it into a
-          // fully-defaulted snapshot so every reader sees the same shape the
-          // composition path produced.
-          setSource: (source) => {
-            this.readSettingsSource = () => resolveAcpSettings(source())
-          },
-          onChange: applySettings,
-        })
-        // installSection hands out no service handle, and /acp config needs
-        // describe/update/replace — capture the service from the same optional
-        // inject (fires only while a provider exists; a no-op otherwise).
-        this.settingsService = settingsCtx.settings
-        // Detach cleanup: cordis disposes the value an inject callback returns
-        // when the provider fiber unloads. Without it the engine would keep a
-        // dead provider handle (/acp config would still report available and
-        // write into a disposed service) and freeze reads at the last value.
-        return () => {
-          this.settingsService = undefined
-          this.readSettingsSource = () => current
-        }
+        // DEGRADE: a settings-shaped service speaking neither API (a future
+        // renamed line or a foreign implementation) — one warn, no capture:
+        // capturing a half-matching handle would make /acp-prune config report
+        // available and fail every write with opaque errors. Values keep
+        // flowing from the composition row through the untouched thunk.
+        this.ctx.logger.warn(
+          'billion-context-dsh: host settings service speaks neither installSection (dsh-settings <= 0.1.6) '
+          + 'nor SettingsForms describe/update/replace (>= 0.1.7) — the compaction-acp settings section is '
+          + 'unavailable; the six knobs keep their composition values',
+        )
+        return undefined
       })
     }
 
@@ -433,7 +609,7 @@ export class AcpCompactionEngine extends CompactionEngine {
       kernel: this.kernel,
       store: this.store,
       // The settings-exposed knobs read LIVE from the settings source, so a
-      // settings.yaml edit (or /acp config set) hot-applies to every
+      // settings.yaml edit (or /acp-prune config set) hot-applies to every
       // subsequent call — consumers never see stale numbers. (ToolEnvironment
       // fields are readonly properties; getters satisfy them.)
       get modelContextLimit() { return engine.readSettingsSource().modelContextLimit ?? DEFAULT_CONTEXT_WINDOW },
@@ -442,7 +618,7 @@ export class AcpCompactionEngine extends CompactionEngine {
       get nudgeEmergencyThresholdPct() { return engine.readSettingsSource().nudgeEmergencyThresholdPct },
       coreOverrides: this.config.coreOverrides,
       // Display-only: which named preset produced the thresholds above (if any),
-      // so /acp status can name it. The resolved pct values above are what the
+      // so /acp-prune status can name it. The resolved pct values above are what the
       // kernel actually reads — this field never feeds kernelConfigFor.
       preset: this.config.preset,
       windowFor: (agent) => this.windowFor(agent),
@@ -498,10 +674,25 @@ export class AcpCompactionEngine extends CompactionEngine {
     // an assistant tool_calls block and its tool response — strict providers
     // reject that request with HTTP 400 (issue #18).
     ctx.on('session/event', (session, event) => {
+      // An assistant message on a session that just overflowed means the retry
+      // (or a later request) made progress: reset that agent's overflow budget
+      // so a FUTURE overflow gets a fresh recovery chance (host parity).
+      if (event.type === 'assistant/message') {
+        const overflowAgent = this.overflowSessions.get(session)
+        if (overflowAgent !== undefined) {
+          this.overflowRetries.delete(overflowAgent)
+          // Drop the reverse lookup as well: it exists ONLY to find the agent
+          // whose budget must be reset, and both terminal paths (progress, or
+          // idle after an unrelieved overflow) walk through here — keeping it
+          // would retain the session and its state for the engine's lifetime.
+          this.overflowSessions.delete(session)
+        }
+      }
       if (event.type !== 'tool/result') return
-      const message = event.data.message
-      const block = message.content[0]
-      const callId = block?.toolCallId ?? message.source.callId
+      // One shared extractor (rule 10): message-level field first, then the
+      // nested tool-result block, then source.callId — one implementation for
+      // call/result pairing everywhere, never a per-listener copy.
+      const callId = toolCallIdOfResultEvent(event)
       if (typeof callId !== 'string' || !this.compressCallIdsToHide.has(callId)) return
       this.compressCallIdsToHide.delete(callId)
       // session.append is NOT reentrant: calling it synchronously inside this
@@ -525,6 +716,10 @@ export class AcpCompactionEngine extends CompactionEngine {
       // in flight at pre-step (the previous step's tools all landed), so the
       // default empty in-flight set is safe.
       stripOrphanedSurfaceToolMessages(payload.agent.session)
+      // Hot-apply settings BEFORE any knob is read this step (issue #193): on
+      // the forms line, writes committed between steps land in our volatile
+      // refs with no event we receive — this re-read is what applies them.
+      engine.resyncSettings()
       if (!engine.readSettingsSource().autoNudge) return next()
       const decision = await next()
       if (decision.kind === 'reject') return decision
@@ -545,6 +740,67 @@ export class AcpCompactionEngine extends CompactionEngine {
       )
       if (outcome === null) return decision
       return { kind: 'enter', messages: [...decision.messages, outcome.message] }
+    })
+    // ── Context-overflow recovery (M5) ─────────────────────────────────
+    // The seam rethrows a failed request unless a listener answers
+    // `agent/request-error` with `{ kind: 'retry' }` (dsh-agent-loop), and
+    // docs/dsh-porting-verification.md (architecture fact 2) says the ACP
+    // engine should copy compaction-basic's two automatic listeners. The
+    // pressure half is deliberately NOT copied — ACP stays model-driven, the
+    // pre-step listener above only nudges — but the overflow half is the ONE
+    // automatic action: on a provider-confirmed CONTEXT_WINDOW_EXCEEDED the
+    // engine emergency-compacts the largest eligible block (a durable,
+    // model-free marker summary; originals stay in the log for
+    // search_context/decompress) and asks the loop to retry. Without this
+    // listener the error was rethrown unretried.
+    ctx.on('agent/status', ({ agent, status }) => {
+      if (status !== 'idle') return
+      this.overflowRetries.delete(agent)
+      this.overflowSessions.delete(agent.session)
+    })
+    ctx.on('agent/request-error', async ({ agent, failure, signal }, next) => {
+      if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE || signal.aborted) return next()
+      this.overflowSessions.set(agent.session, agent)
+      const retries = this.overflowRetries.get(agent) ?? 0
+      // `resolveAcpConfig` normalizes the value, so this fallback only guards a
+      // future config shape; it MUST stay 1 (the host's own default) — reading 0
+      // here would disable overflow recovery for a key that was never set to 0.
+      const max = this.config.maxOverflowRetries ?? 1
+      if (retries >= max) {
+        this.ctx.logger.warn(
+          `billion-context-dsh: context-overflow recovery budget spent (${max} retries) for session ${agent.session.id}; preserving the original request error`,
+        )
+        return next()
+      }
+      const generation = agent.session.surface.replaceGeneration
+      let result: OverflowRecoveryResult | null
+      try {
+        result = await this.compactForOverflow(agent, signal)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        if (!signal.aborted && agent.session.surface.replaceGeneration > generation) {
+          // The durable transaction landed but the follow-through threw: the
+          // surface shrank, so retrying from the replacement surface is the
+          // best move even though the bookkeeping failed.
+          this.ctx.logger.warn(
+            `billion-context-dsh: context-overflow compaction failed after durable surface progress: ${message}; retrying from the replacement surface`,
+          )
+          this.overflowRetries.set(agent, retries + 1)
+          return { kind: 'retry' }
+        }
+        this.ctx.logger.warn(
+          `billion-context-dsh: context-overflow compaction failed: ${message}; ${signal.aborted ? 'cancellation prevents retry' : 'preserving the original request error'}`,
+        )
+        return next()
+      }
+      if (signal.aborted || agent.session.surface.replaceGeneration <= generation) return next()
+      if (result !== null) {
+        this.ctx.logger.info(
+          `compaction (context overflow recovery): shadowed ${result.shadowedSeqs.length} surface nodes (seqs ${result.start}-${result.end}, ~${result.shadowedTokenCount} tokens)`,
+        )
+      }
+      this.overflowRetries.set(agent, retries + 1)
+      return { kind: 'retry' }
     })
     // The load-bearing ACP guidance lives in the system prompt ONCE; nudges
     // stay short and advisory (model-driven: the model decides). The
@@ -641,7 +897,7 @@ export class AcpCompactionEngine extends CompactionEngine {
         // came from (a gateway that disclosed no window read as ~55% of 128K
         // when the real window was 1M).
         this.ctx.logger.warn(
-          `billion-context-dsh: context-window auto-detection failed for ${provider}/${model} — using the ${DEFAULT_CONTEXT_WINDOW} fallback (change modelContextLimit or autoModelContextLimit via /acp config — or restart — to re-probe)`,
+          `billion-context-dsh: context-window auto-detection failed for ${provider}/${model} — using the ${DEFAULT_CONTEXT_WINDOW} fallback (change modelContextLimit or autoModelContextLimit via /acp-prune config — or restart — to re-probe)`,
         )
         window = { limit: DEFAULT_CONTEXT_WINDOW, source: 'default', provider, model, probeFailed: true }
         cap = null // the probe failed or disclosed nothing — no cap either
@@ -697,6 +953,100 @@ export class AcpCompactionEngine extends CompactionEngine {
   private applyReservation(window: AcpWindow, cap: number | null): AcpWindow {
     if (cap === null || cap >= window.limit) return window
     return { ...window, rawLimit: window.limit, outputReserved: cap, limit: window.limit - cap }  }
+
+  /**
+   * Best-effort emergency compaction for one provider-confirmed context
+   * overflow: pick the largest eligible (guarded, tool-pairing-balanced)
+   * surface range and land the normal durable transaction with a fixed
+   * engine-written marker summary. No LLM call — the provider just rejected
+   * the request for being too large, so there is no model turn available to
+   * write a summary; the originals stay in the append-only log, so
+   * search_context still indexes them, decompress restores them, and the
+   * model can re-run the compress tool over the marker later to write a real
+   * summary. Returns null when nothing eligible exists (nothing to reclaim).
+   */
+  private async compactForOverflow(agent: Agent, signal: AbortSignal): Promise<OverflowRecoveryResult | null> {
+    signal.throwIfAborted()
+    const session = agent.session
+    const state = this.store.stateFor(session)
+    const coreMessages = allLogMessages(session)
+    const surfaceMessages = eventsToCoreMessages(surfaceEventsOf(session))
+    const tokenCount = resolveTokenCount(agent, surfaceMessages)
+    const window = await this.windowFor(agent)
+    const config = kernelConfigFor({ ...this.env, modelContextLimit: window.limit })
+    // processTurn assigns the mNNNNN ref map the kernel transaction needs
+    // (the same contract handleCompress relies on); renderTags 'none' keeps
+    // message text untouched — we read the ref map directly.
+    const turn = this.kernel.processTurn({ messages: coreMessages, state, config, tokenCount, renderTags: 'none' })
+    this.store.set(session, turn.state)
+    const byRaw = turn.state.messageRefs.byRaw
+    // One kernel range spanning the whole surface: buildCompressibleSeqRanges
+    // applies the host guards (protected tail, last real user turn, CURRENT
+    // instruction rows, checkpoints, the system node) and splits it into
+    // balanced segments — the same geometry the nudge range table offers the
+    // model, so the emergency path can only shadow what the model itself
+    // could have compressed.
+    let firstSeq: number | undefined
+    let lastSeq: number | undefined
+    for (const seq of session.surface.nodes) {
+      if (byRaw[String(seq)] === undefined) continue
+      firstSeq ??= seq
+      lastSeq = seq
+    }
+    if (firstSeq === undefined || lastSeq === undefined) return null
+    const view: KernelRangeView = {
+      ranges: [{ startRef: byRaw[String(firstSeq)]!, endRef: byRaw[String(lastSeq)]! }],
+      refs: { byRef: turn.state.messageRefs.byRef },
+    }
+    // `preserveRecent: 5` is region.ts's own default (the nudge range table's
+    // recent-tail protection), pinned EXPLICITLY here: this path acts without
+    // asking the model, so its safety margin must not silently drift with a
+    // tuning change made for the advisory table.
+    const ranges = buildCompressibleSeqRanges(session, view, {
+      preserveRecent: 5,
+      mediaPriceOf: meterMediaPriceResolver(agent, session),
+    })
+    if (ranges.length === 0) return null
+    // Host parity: one useful balanced reduction — the largest eligible
+    // range, priced in the same vocabulary as the nudge range table.
+    const best = ranges.reduce((largest, range) => (range.tokens > largest.tokens ? range : largest))
+    const startRef = byRaw[String(best.start)]
+    const endRef = byRaw[String(best.end)]
+    if (startRef === undefined || endRef === undefined) return null
+    // Engine-written marker: the shared constructor in src/messages.ts is what
+    // makes the projection net exempt it from the model-written frame, so the
+    // model-visible text and the durable/decompress text stay identical.
+    const summary = overflowMarkerSummary(best.count)
+    const applied = this.kernel.applyCompression({
+      ranges: [{ startRef, endRef, summary, topic: 'context-overflow recovery' }],
+      messages: coreMessages,
+      state: turn.state,
+      config,
+    })
+    if (applied.result.blocksCreated === 0) return null
+    this.store.set(session, applied.state)
+    const previousIds = new Set(turn.state.blocks.map((block) => block.blockId))
+    const created = applied.state.blocks.find((block) => !previousIds.has(block.blockId))
+    if (created === undefined) return null
+    const shadowed = shadowedSeqsOf(session, best.start, best.end)
+    if (shadowed.length === 0) return null
+    const shadowedTokenCount = shadowedTokensViaMeter(session, shadowed, agent.ctx)
+    const { provider, model } = routeFor(agent)
+    runCompactionTransaction(session, {
+      start: best.start,
+      end: best.end,
+      shadowedSeqs: shadowed,
+      summary: [{ type: 'text', text: summary }],
+      shadowedTokenCount,
+      provider,
+      model,
+      topic: 'context-overflow recovery',
+      kernelBlockId: created.blockId,
+      directMessageIds: created.directMessageIds,
+      effectiveMessageIds: created.effectiveMessageIds,
+    })
+    return { start: best.start, end: best.end, shadowedSeqs: shadowed, shadowedTokenCount }
+  }
 
   /** ACP is model-driven: automatic pressure policy never summarizes by itself. */
   override async compactIfNeeded(

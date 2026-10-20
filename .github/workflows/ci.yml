@@ -26,7 +26,13 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Node 22, not 20: the durable-row admission net (issue #183) loads
+          # the released JSONL persistence codec, which statically imports the
+          # node:zlib zstd API that only exists from Node 22.15 on — on Node 20
+          # the module fails at link time before any test runs. e2e.yml already
+          # ran on 22; the package's own support floor (engines >= 20) is
+          # unchanged, this is only the test-runner runtime.
+          node-version: 22
           cache: npm
 
       - name: Install dependencies
@@ -57,7 +63,7 @@ jobs:
       # This comparison assumes deterministic builds across platforms: the
       # committed dist/ is built locally (macOS) while CI rebuilds on
       # ubuntu-latest. It holds because the toolchain is lockfile-pinned
-      # (typescript / tsup / esbuild, acp-kernel 0.0.63 inlined) and the
+      # (typescript / tsup / esbuild, acp-kernel inlined) and the
       # sourcemap carries relative paths only. If a future toolchain change
       # introduces platform-dependent bytes or CRLF output, this check will
       # false-positive — treat that as a build-determinism regression to

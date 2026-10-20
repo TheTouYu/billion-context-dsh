@@ -21,7 +21,7 @@
  * ```
  *
  * The package registers `ctx.compaction` plus the four model tools and the
- * `/acp` command when the hosting composition provides `ctx.tools` /
+ * `/acp-prune` command when the hosting composition provides `ctx.tools` /
  * `ctx.commands`.
  * @module billion-context-dsh
  */
@@ -46,7 +46,7 @@ export { buildNudge, resolveTokenCount, EMERGENCY_NUDGE_MAX_PER_TURN, type Nudge
 export { DEFAULT_CONTEXT_WINDOW, detectContextWindow, projectedContextWindow, windowSourceLabel, type AcpWindow, } from './window.ts';
 export { AlreadyCompressedRangeError, rebuildBlockLedger, resolveSurfaceRange, runCompactionTransaction, shadowedSeqsOf, findOpenTurn, assertNoActiveCompaction, blockRegistry, blockRefForSummarySeq, compactionIdsOfKernelBlocks, summarySeqOfKernelBlock, expandShadowedSeqs, hideCompressToolPair, stripOrphanedSurfaceToolMessages, type AcpBlockLedgerEntry, type CompactionTransactionInput, type ResolvedSurfaceRange, } from './region.ts';
 export { eventsToCoreMessages, projectEvent, surfaceEventsOf, extractEventText } from './messages.ts';
-export { ACP_SETTINGS_NAMESPACE, AcpSettingsSchema, describeSettingsChange, filterSettingsEntry, makeSettingsCommandSurface, parseSettingValue, resolveAcpSettings, SETTINGS_KEYS, SETTING_DEFAULTS, type AcpSettings, type AcpSettingsInput, type SettingsChangeEffect, type SettingsCommandSurface, type SettingsKey, } from './settings.ts';
+export { ACP_SETTINGS_NAMESPACE, AcpPluginConfigSchema, AcpSettingsSchema, describeSettingsChange, filterSettingsEntry, isVolatileRef, liveSettingsFromRefs, makeSettingsCommandSurface, parseSettingValue, resolveAcpSettings, SETTINGS_KEYS, SETTING_DEFAULTS, unwrapVolatile, VOLATILE_WRITE, type AcpSettings, type AcpSettingsDescriptor, type AcpSettingsInput, type AcpSettingsService, type LegacySettingsService, type SettingsChangeEffect, type SettingsCommandSurface, type SettingsKey, } from './settings.ts';
 export interface AcpConfig {
     /**
      * The context window used for pressure decisions, in tokens. When omitted,
@@ -111,10 +111,19 @@ export interface AcpConfig {
     readonly countTokens?: (text: string) => number;
     /** Register the four model tools on `ctx.tools`. Default true. */
     readonly autoTools: boolean;
-    /** Register the `/acp` command on `ctx.commands`. Default true. */
+    /** Register the `/acp-prune` command on `ctx.commands`. Default true. */
     readonly autoCommand: boolean;
     /** Inject the nudge into `agent/pre-step` when the kernel recommends it. Default true. */
     readonly autoNudge: boolean;
+    /**
+     * How many consecutive provider-confirmed context-overflow failures one
+     * agent may answer with an emergency compaction + retry before the original
+     * error is preserved (mirrors compaction-basic's `maxOverflowRetries`;
+     * default 1, the host's own default). The budget resets when the agent
+     * makes progress (an assistant message lands) or returns to idle, so a
+     * request that cannot be repaired cannot retry forever.
+     */
+    readonly maxOverflowRetries?: number;
     /**
      * Escape hatch: disable the runtime-settings integration entirely
      * (composition-layer ONLY — deliberately not exposed through the settings
@@ -132,6 +141,31 @@ export declare function resolveAcpConfig(config?: Partial<AcpConfig>): AcpConfig
  * model-driven block compression without touching the agent loop.
  */
 export declare class AcpCompactionEngine extends CompactionEngine {
+    /**
+     * Static plugin config schema — cordis reads `plugin.Config` off the raw
+     * plugin value at fiber start and validates the composition row against it
+     * (`resolveConfig`). Class-shaped mounts carry this (the bundle/composition
+     * row path); function-shaped mounts skip validation and receive plain
+     * values. On dsh-settings ≥ 0.1.7 hosts this SAME schema is what SettingsForms
+     * builds its form from — the volatile fields are exactly what `/acp-prune
+     * config` exposes (see AcpPluginConfigSchema for why fields are volatile and
+     * default-free).
+     */
+    static readonly Config: import("@deepseek-ai/schemastery").default<Schemastery.ObjectS<NoInfer<{
+        modelContextLimit: import("@deepseek-ai/schemastery").default<number, number, "plain">;
+        autoModelContextLimit: import("@deepseek-ai/schemastery").default<boolean, boolean, "plain">;
+        nudgeMinContextLimitPct: import("@deepseek-ai/schemastery").default<number, number, "plain">;
+        nudgeMaxContextLimitPct: import("@deepseek-ai/schemastery").default<number, number, "plain">;
+        nudgeEmergencyThresholdPct: import("@deepseek-ai/schemastery").default<number, number, "plain">;
+        autoNudge: import("@deepseek-ai/schemastery").default<boolean, boolean, "plain">;
+    }>>, Schemastery.ObjectT<NoInfer<{
+        modelContextLimit: import("@deepseek-ai/schemastery").default<number, number, "plain">;
+        autoModelContextLimit: import("@deepseek-ai/schemastery").default<boolean, boolean, "plain">;
+        nudgeMinContextLimitPct: import("@deepseek-ai/schemastery").default<number, number, "plain">;
+        nudgeMaxContextLimitPct: import("@deepseek-ai/schemastery").default<number, number, "plain">;
+        nudgeEmergencyThresholdPct: import("@deepseek-ai/schemastery").default<number, number, "plain">;
+        autoNudge: import("@deepseek-ai/schemastery").default<boolean, boolean, "plain">;
+    }>>, "plain">;
     /** The framework-agnostic ACP compression core, reused verbatim. */
     readonly kernel: CompressionCore;
     /** Per-session kernel state. */
@@ -155,14 +189,20 @@ export declare class AcpCompactionEngine extends CompactionEngine {
     private readonly compressCallIdsToHide;
     /** Per provider/model route the resolved window (probe failures cached too). */
     private readonly windowCache;
-    /** Live settings snapshot thunk (composition → user settings layer); swapped when the settings provider attaches (SettingsProvider.installSection). */
+    /** Live settings snapshot thunk (composition → user settings layer); swapped when the settings provider attaches (installSection on ≤0.1.6 lines, volatile-ref re-read on the ≥0.1.7 forms line). */
     private readSettingsSource;
-    /** The settings service, captured lazily for /acp config (undefined in provider-less processes). */
+    /** Hot-apply driver: re-reads the live source and runs the change diff; called once per agent step, a no-op unless something changed. */
+    private resyncSettings;
+    /** The settings service, captured lazily for /acp-prune config (undefined in provider-less processes). Structurally typed — both host lines' real services satisfy it. */
     private settingsService;
-    /** /acp config read/write surface. */
+    /** /acp-prune config read/write surface. */
     readonly settingsCommand: SettingsCommandSurface;
     /** Per route the adapter's per-request output cap (the output reservation); null = undisclosed. */
     private readonly outputReservationCache;
+    /** Per-agent context-overflow recovery budget (mirrors the host's `overflowRetries`). */
+    private readonly overflowRetries;
+    /** Per-session overflow agents, so session progress can reset the recovery budget. */
+    private readonly overflowSessions;
     constructor(ctx: Context, config?: Partial<AcpConfig>);
     /**
      * Resolve the effective context window for an agent. An explicitly
@@ -208,6 +248,18 @@ export declare class AcpCompactionEngine extends CompactionEngine {
      * (degenerate config) — the raw-window behavior is preserved.
      */
     private applyReservation;
+    /**
+     * Best-effort emergency compaction for one provider-confirmed context
+     * overflow: pick the largest eligible (guarded, tool-pairing-balanced)
+     * surface range and land the normal durable transaction with a fixed
+     * engine-written marker summary. No LLM call — the provider just rejected
+     * the request for being too large, so there is no model turn available to
+     * write a summary; the originals stay in the append-only log, so
+     * search_context still indexes them, decompress restores them, and the
+     * model can re-run the compress tool over the marker later to write a real
+     * summary. Returns null when nothing eligible exists (nothing to reclaim).
+     */
+    private compactForOverflow;
     /** ACP is model-driven: automatic pressure policy never summarizes by itself. */
     compactIfNeeded(_agent: CompactionAgentContext, _trigger: CompactionTrigger, signal: AbortSignal): Promise<CompactionResult | null>;
     /** Explicit idle-session compaction: ACP leaves the decision to the model. */

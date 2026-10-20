@@ -9,7 +9,7 @@ import { type CompressionCore, type CompressionState, type ContextBreakdown, typ
 import { type UserMessage } from '@deepseek-ai/dsh-llm';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { AcpStateStore } from './state.ts';
-import { type KernelRangeView } from './region.ts';
+import { type KernelRangeView, type MediaPriceOf } from './region.ts';
 import { type KernelConfigInput } from './config.ts';
 import { type ResolvedPrompts } from './prompts.ts';
 export declare function stripNudgeGuidance(text: string): string;
@@ -39,6 +39,14 @@ export interface NudgeOutcome {
  */
 export declare function resolveTokenCount(agent: Agent, coreMessages: CoreMessage[]): number;
 /**
+ * Lazy per-seq media price. The FIRST lookup triggers one meter measurement, so
+ * the range walk only asks about seqs that really carry an attachment — a
+ * media-free session never pays for the measurement (issue #117, issue #110).
+ * Exported for the context-overflow recovery path, which ranks ranges with the
+ * same vocabulary as the nudge table.
+ */
+export declare function meterMediaPriceResolver(agent: Agent, session: import('@deepseek-ai/dsh-session').Session): MediaPriceOf;
+/**
  * Render the compressible-range table as seq refs for the model.
  *
  * The spans are the kernel's own (`compressibleRanges`, translated to surface
@@ -47,7 +55,7 @@ export declare function resolveTokenCount(agent: Agent, coreMessages: CoreMessag
  * `UPSTREAM:` workaround for kernel ref-map drift; that drift is fixed upstream
  * (acp-kernel #207) and the workaround is gone (rule 11).
  */
-export declare function rangeTable(session: import('@deepseek-ai/dsh-session').Session, kernelView: KernelRangeView, prompts?: ResolvedPrompts): string;
+export declare function rangeTable(session: import('@deepseek-ai/dsh-session').Session, kernelView: KernelRangeView, prompts?: ResolvedPrompts, mediaPriceOf?: MediaPriceOf): string;
 /**
  * Compute a SURFACE-ONLY context breakdown for display, aligned with
  * `acp_status` (kernel `buildStatusReport`/`renderOverview`).
@@ -70,7 +78,7 @@ export declare function rangeTable(session: import('@deepseek-ai/dsh-session').S
  * source marker). We instead count active-block summaries directly from kernel
  * state (same source `buildStatusReport` uses), and the caller must exclude
  * checkpoint summary nodes from `messages` (they are not in any block's
- * `effectiveMessageIds` and would double-count — mirror of `/acp` status's
+ * `effectiveMessageIds` and would double-count — mirror of `/acp-prune` status's
  * `isCheckpointNode` exclusion).
  */
 export declare function computeSurfaceBreakdown(state: CompressionState, messages: readonly CoreMessage[], total: number, growth: number): ContextBreakdown;
@@ -112,4 +120,4 @@ export declare function buildNudge(agent: Agent, env: NudgeEnvironment, lastNudg
  * When a host overrides any `prompts.nudge` slot, the template path is used so
  * `config.prompts` keeps full control (custom copy wins over kernel defaults).
  */
-export declare function buildNudgeText(nudge: NudgeDecision, emergency: boolean, session: import('@deepseek-ai/dsh-session').Session, kernelView: KernelRangeView, prompts?: ResolvedPrompts): string;
+export declare function buildNudgeText(nudge: NudgeDecision, emergency: boolean, session: import('@deepseek-ai/dsh-session').Session, kernelView: KernelRangeView, prompts?: ResolvedPrompts, mediaPriceOf?: MediaPriceOf): string;

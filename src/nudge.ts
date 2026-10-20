@@ -22,14 +22,17 @@ import {
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { AcpStateStore } from './state.ts'
-import { allLogMessages, engineSource, eventsToCoreMessages, isCheckpointNode, surfaceEventsOf } from './messages.ts'
+import { allLogMessages, eventsToCoreMessages, isCheckpointNode, surfaceEventsOf } from './messages.ts'
 import {
   buildCompressibleSeqRanges,
   findOpenTurn,
   summarySeqOfKernelBlock,
   surfaceSummary,
   type KernelRangeView,
+  type MediaPriceOf,
+  type SeqCompressibleRange,
 } from './region.ts'
+import { mediaPriceViaMeter } from './host-tokens.ts'
 import { sessionEventsOf } from './session-events.ts'
 import { kernelConfigFor, type KernelConfigInput } from './config.ts'
 import { DEFAULT_RESOLVED, renderTemplate, type ResolvedPrompts } from './prompts.ts'
@@ -112,6 +115,40 @@ function kernelRangeViewOf(nudge: NudgeDecision, state: CompressionState): Kerne
 }
 
 /**
+ * Range-row suffix naming the image/file blocks a span carries, so the model
+ * does not read "~0 tokens" as "nothing to reclaim" for a picture-heavy span
+ * (issue #117). Counts, not prices: the price sits in the token column.
+ */
+function mediaSuffixOf(range: SeqCompressibleRange): string {
+  if (range.images === 0 && range.files === 0) return ''
+  const parts: string[] = []
+  if (range.images > 0) parts.push(`+${range.images} image${range.images === 1 ? '' : 's'}`)
+  if (range.files > 0) parts.push(`+${range.files} file${range.files === 1 ? '' : 's'}`)
+  // ` | ` is the separator the same row already uses for the tool/text share
+  // column (`[tool X% | text Y%]`) and the one AGENTS.md rule 19 documents; a
+  // comma inside the bracket reads as prose.
+  return ` [${parts.join(' | ')}]`
+}
+
+/**
+ * Lazy per-seq media price. The FIRST lookup triggers one meter measurement, so
+ * the range walk only asks about seqs that really carry an attachment — a
+ * media-free session never pays for the measurement (issue #117, issue #110).
+ * Exported for the context-overflow recovery path, which ranks ranges with the
+ * same vocabulary as the nudge table.
+ */
+export function meterMediaPriceResolver(
+  agent: Agent,
+  session: import('@deepseek-ai/dsh-session').Session,
+): MediaPriceOf {
+  let prices: ReadonlyMap<number, number> | null = null
+  return (seq: number) => {
+    if (prices === null) prices = mediaPriceViaMeter(session, agent.ctx)
+    return prices.get(seq) ?? 0
+  }
+}
+
+/**
  * Render the compressible-range table as seq refs for the model.
  *
  * The spans are the kernel's own (`compressibleRanges`, translated to surface
@@ -124,8 +161,13 @@ export function rangeTable(
   session: import('@deepseek-ai/dsh-session').Session,
   kernelView: KernelRangeView,
   prompts: ResolvedPrompts = DEFAULT_RESOLVED,
+  mediaPriceOf?: MediaPriceOf,
 ): string {
-  const ranges = buildCompressibleSeqRanges(session, kernelView).slice(0, 6)
+  const ranges = buildCompressibleSeqRanges(
+    session,
+    kernelView,
+    mediaPriceOf === undefined ? {} : { mediaPriceOf },
+  ).slice(0, 6)
   // 零范围:整块省略(保留现状的提前返回与 nudge 尾部 '\n')。
   if (ranges.length === 0) return ''
   const lines = ranges.map((range) =>
@@ -136,6 +178,7 @@ export function rangeTable(
       tokens: range.tokens,
       toolPct: range.toolPct,
       textPct: 100 - range.toolPct,
+      media: mediaSuffixOf(range),
     }),
   )
   return [
@@ -181,7 +224,7 @@ function measuredTokenCount(agent: Agent, coreMessages: CoreMessage[]): number {
  * source marker). We instead count active-block summaries directly from kernel
  * state (same source `buildStatusReport` uses), and the caller must exclude
  * checkpoint summary nodes from `messages` (they are not in any block's
- * `effectiveMessageIds` and would double-count — mirror of `/acp` status's
+ * `effectiveMessageIds` and would double-count — mirror of `/acp-prune` status's
  * `isCheckpointNode` exclusion).
  */
 export function computeSurfaceBreakdown(
@@ -256,13 +299,17 @@ export function buildNudge(
 
   const nudge = turn.nudge
   if (nudge === undefined || !nudge.shouldInject) return null
+  // Media-bearing spans are invisible to every text estimator, so their price
+  // comes from the host meter. Lazily: a media-free session never pays for a
+  // measurement (meterMediaPriceResolver only measures on first lookup).
+  const mediaPriceOf = meterMediaPriceResolver(agent, session)
   // The kernel computed `contextBreakdown` from the FULL log (allLogMessages),
   // so after any compression it reports HISTORICAL totals (a huge `tool` that
   // is really the compressed-away originals). Override it with the visible
   // surface + active-block summaries so the nudge line matches acp_status
   // (which renders from `buildStatusReport` over the surface). Checkpoint
   // summary nodes are excluded (they are not in any block's effectiveMessageIds
-  // and would double-count) — the same exclusion `/acp` status applies. The
+  // and would double-count) — the same exclusion `/acp-prune` status applies. The
   // breakdown is display-only and never drives injection, so this override is
   // safe for the decision path.
   const statusMessages = eventsToCoreMessages(
@@ -294,10 +341,23 @@ export function buildNudge(
     }
   }
 
-  const text = buildNudgeText(nudge, emergency, session, kernelRangeViewOf(nudge, turn.state), env.prompts)
+  const text = buildNudgeText(
+    nudge,
+    emergency,
+    session,
+    kernelRangeViewOf(nudge, turn.state),
+    env.prompts,
+    mediaPriceOf,
+  )
   const message = createUserMessage({
     content: [{ type: 'text', text }],
-    source: engineSource('acp-nudge', 'nudge'),
+    // V4 producer kind (issue #163): DSH ≥0.1.7's V4 admission rejects the
+    // legacy wrapper shape `{ kind: 'plugin', plugin: … }` outright (a wedged
+    // batch fails the NEXT turn with "format v4 message requires a
+    // producer-owned source kind"). `plugin:<name>` is exactly what the host's
+    // own V3→V4 migration emits for unregistered plugins, and DSH 0.1.5
+    // sessions accept it too (probe-verified), so no version gate is needed.
+    source: { kind: 'plugin:acp-nudge' },
   })
   return { message, emergency }
 }
@@ -321,15 +381,16 @@ export function buildNudgeText(
   session: import('@deepseek-ai/dsh-session').Session,
   kernelView: KernelRangeView,
   prompts: ResolvedPrompts = DEFAULT_RESOLVED,
+  mediaPriceOf?: MediaPriceOf,
 ): string {
   // A host override of any nudge slot → template rendering (config.prompts
   // keeps its v0.1.9 contract: custom copy wins). Only the pristine default
   // reference reaches the kernel path.
   if (prompts.nudge !== DEFAULT_RESOLVED.nudge) {
-    return renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts)
+    return renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf)
   }
   const rendered = renderNudgeText(nudge)
-  return adaptKernelNudgeToSeq(rendered.text, nudge, session, kernelView, prompts)
+  return adaptKernelNudgeToSeq(rendered.text, nudge, session, kernelView, prompts, mediaPriceOf)
 }
 
 /**
@@ -352,6 +413,7 @@ function adaptKernelNudgeToSeq(
   session: import('@deepseek-ai/dsh-session').Session,
   kernelView: KernelRangeView,
   prompts: ResolvedPrompts,
+  mediaPriceOf?: MediaPriceOf,
 ): string {
   // B6：先摘掉哲学/规则段（它们住在系统提示与工具描述里），再做 seq 适配
   let out = stripNudgeGuidance(text)
@@ -367,9 +429,30 @@ function adaptKernelNudgeToSeq(
   // Replace the ref-ID range table (mNNNNN) with the surface-seq table.
   // A zero-range table leaves the kernel's own "[No specific ranges detected]"
   // notice intact — it is a better prompt than an empty table.
-  const seqTable = rangeTable(session, kernelView, prompts)
+  const seqTable = rangeTable(session, kernelView, prompts, mediaPriceOf)
   if (seqTable !== '') out = replaceRangesStr(out, seqTable)
+  out = insertContentFormNote(out)
   return out
+}
+
+/**
+ * The kernel's batch tip (0.0.101) advertises TWO content forms — the array
+ * form and a plain string ("most robust through lossy gateways"). This tool's
+ * schema takes the array form only: our ref dialect is surface seqs, and
+ * `content` must be `[{ startSeq, endSeq, summary }]`. Rather than rewrite the
+ * kernel's copy (rule 9: the kernel owns the prompt), the engine states the
+ * difference in ONE line, placed BEFORE the tip so the tip stays the last
+ * thing the model reads. Without it a model that follows the tip gets a schema
+ * rejection it has to re-learn from mid-batch.
+ */
+const CONTENT_FORM_NOTE =
+  'Note: this tool takes the array form only — compress({ content: [{ startSeq, endSeq, summary }] }) with the surface seqs above; a plain-string content is rejected.'
+
+/** Insert the array-form note right before the kernel's closing tip (no tip → text unchanged). */
+function insertContentFormNote(text: string): string {
+  const tipAt = text.lastIndexOf('\n\n\u{1F4A1} ')
+  if (tipAt === -1) return text
+  return text.slice(0, tipAt) + '\n\n' + CONTENT_FORM_NOTE + text.slice(tipAt)
 }
 
 /** Replace the kernel rangesStr segment (`Compressible ranges (N, oldest first):…`) with our seq table. */
@@ -402,7 +485,7 @@ function replaceTierTrigger(
   const targets = nudge.tierTargetBlocks!
   const summarySeqs = targets
     .map((block) => summarySeqOfKernelBlock(session, block.blockId))
-    .filter((seq): seq is number => seq !== null)
+    .filter((seq): seq is number => seq != null)
     .sort((a, b) => a - b)
   const pending = nudge.tier === 2 ? nudge.breakdown?.pendingT2 : nudge.breakdown?.pendingT3
   const tokens = typeof pending === 'number' ? pending : 0
@@ -442,6 +525,7 @@ function renderNudgeFromTemplates(
   session: import('@deepseek-ai/dsh-session').Session,
   kernelView: KernelRangeView,
   prompts: ResolvedPrompts,
+  mediaPriceOf?: MediaPriceOf,
 ): string {
   // Cap the reported percentage at 100: a broken measurement (e.g. response
   // pressure folded in) must never surface as an absurd "230%" to the model.
@@ -477,7 +561,7 @@ function renderNudgeFromTemplates(
     const targets = nudge.tierTargetBlocks!
     const summarySeqs = targets
       .map((block) => summarySeqOfKernelBlock(session, block.blockId))
-      .filter((seq): seq is number => seq !== null)
+      .filter((seq): seq is number => seq != null)
       .sort((a, b) => a - b)
     const pending = nudge.tier === 2 ? nudge.breakdown?.pendingT2 : nudge.breakdown?.pendingT3
     const tokens = typeof pending === 'number' ? pending : 0
@@ -496,11 +580,13 @@ function renderNudgeFromTemplates(
     parts.push('', tierRules)
   } else {
     // Range table for non-tier nudges (DSH-specific: seq-based, not ref-ID-based).
-    parts.push(rangeTable(session, kernelView, prompts))
+    parts.push(rangeTable(session, kernelView, prompts, mediaPriceOf))
   }
 
-  // Batch-compress tip (from kernel's nudge-text.ts style).
-  if (prompts.nudge.tip !== '') parts.push('', prompts.nudge.tip)
+  // Batch-compress tip (from kernel's nudge-text.ts style). The array-form
+  // note rides with it on this path too — a host that overrides only the tip
+  // must not lose the tool-contract line (same hole B6 closed for guidance).
+  if (prompts.nudge.tip !== '') parts.push('', CONTENT_FORM_NOTE, '', prompts.nudge.tip)
 
   // B6：模板路径同样摘掉哲学/规则段——否则宿主只要覆盖任一 nudge 槽位（如只改 tip），
   // 整份 6 KB 指引就会重新贴回来（独立复核 2026-09-08 发现的软缺口）。

@@ -22,7 +22,7 @@ import type { PresetName } from './presets.ts';
 export interface ToolEnvironment extends KernelConfigInput {
     readonly kernel: CompressionCore;
     readonly store: AcpStateStore;
-    /** Display-only: the named preset that produced the nudge thresholds above, if any (`/acp status` names it). Never read by the kernel path. */
+    /** Display-only: the named preset that produced the nudge thresholds above, if any (`/acp-prune status` names it). Never read by the kernel path. */
     readonly preset?: PresetName;
     /** Resolve the effective context window for an agent (optional: status falls back to modelContextLimit). */
     readonly windowFor?: (agent: Agent) => Promise<AcpWindow>;
@@ -36,7 +36,7 @@ export interface ToolEnvironment extends KernelConfigInput {
      */
     readonly compressCallIdsToHide?: Set<string>;
     /**
-     * Read/write access to the runtime settings layer for `/acp config`.
+     * Read/write access to the runtime settings layer for `/acp-prune config`.
      * Absent surfaces (never expected — the engine always builds one) would
      * degrade the command to advice text.
      */
@@ -46,7 +46,7 @@ export interface ToolEnvironment extends KernelConfigInput {
  * Resolve the effective context window for a tool or command run: probe the
  * agent's real window via `windowFor` when provided, otherwise fall back to
  * the environment's `modelContextLimit`. Shared by the compress and
- * acp_status tool handlers and the `/acp` command so the resolution logic
+ * acp_status tool handlers and the `/acp-prune` command so the resolution logic
  * lives in exactly one place (issue #63 — the tools used the 128K fallback
  * for pressure decisions even when auto-detection had found a larger window).
  */
@@ -73,7 +73,7 @@ export declare const compressParameters: {
                         readonly description: 'First surface seq of the range.';
                     }, {
                         readonly type: 'string';
-                        readonly description: 'Seq as text; a trailing #callId fragment is ignored.';
+                        readonly description: 'Seq as text; a trailing #callId fragment is ignored. A drilldown mN ref ("m00306") or a kernel block id ("b1", as acp_status lists) is also accepted — a block id resolves to that block\'s checkpoint seq, which makes the fold a tier 2/3 distillation.';
                     }];
                 };
                 readonly endSeq: {
@@ -83,7 +83,7 @@ export declare const compressParameters: {
                         readonly description: 'Inclusive last surface seq of the range.';
                     }, {
                         readonly type: 'string';
-                        readonly description: 'Seq as text; a trailing #callId fragment is ignored.';
+                        readonly description: 'Seq as text; a trailing #callId fragment is ignored. Also accepts a drilldown mN ref or a kernel block id ("b3") — for a multi-block condense name the LAST block id (tier 3).';
                     }];
                 };
                 readonly summary: {
@@ -107,6 +107,8 @@ export declare const compressParameters: {
         };
     };
 };
+/** Exported so the ref-width contract test can pin it without a 100K-message fixture. */
+export declare function mnRefIndex(value: string): number | null;
 /**
  * Pure gate helpers for the compress tool's CURRENT-instruction-row rejection.
  *
@@ -121,8 +123,12 @@ export declare const compressParameters: {
  * manual path consistent with the system-side GC's iron rule (PR2: never
  * clear a group's newest row). STALE copies stay compressible: removing them
  * while the newest stays visible is the actual cleanup and triggers no
- * re-injection. The range table (buildCompressibleSeqRanges) never offers
- * these rows, so the gate only fires on hand-built ranges.
+ * re-injection. Skill-catalog rows joined the guard set for a DIFFERENT
+ * reason (issue #185): they are not self-healing at all — the host resends
+ * the catalog only when its digest changes, so a folded catalog stays gone
+ * until the catalog actually changes. The range table
+ * (buildCompressibleSeqRanges) never offers these rows, so the gate only fires
+ * on hand-built ranges.
  *
  * `guardedRowsInSpan` is the overlap probe. It takes the POSITIONAL span the
  * transaction will actually shadow (`shadowedSeqsOf`), never a numeric
@@ -140,7 +146,39 @@ export declare const compressParameters: {
  * `guardedSurfaceSeqsOf` supplies the protected set.
  */
 export declare function guardedRowsInSpan(guarded: ReadonlySet<number>, shadowed: readonly number[]): number[];
-export declare function protectedRowRejectionNote(start: number, end: number, hits: readonly number[], shadowed: readonly number[]): string;
+/**
+ * Advisory note for a plain range that would fold a LIVE block's checkpoint
+ * carrier (see `liveCheckpointCarriersInSpan`). Names the block ids the model
+ * can use instead — a block-ref boundary is the call that legitimately folds
+ * carriers (tier 2/3 distillation).
+ */
+export declare function liveCarrierRejectionNote(start: number, end: number, carriers: readonly {
+    seq: number;
+    kernelBlockId: string;
+}[]): string;
+export declare function protectedRowRejectionNote(start: number, end: number, hits: readonly number[], shadowed: readonly number[], session?: Session): string;
+/**
+ * Kernel ref for one RESOLVED range edge's surface node (issue #155).
+ * Resolved edges are tool-pairing-balanced and anchorable, but NO LONGER
+ * guaranteed to carry a bare-`${seq}` ref: a multi-tool-call assistant
+ * projects to `${seq}#${callId}` sub-ids, and an empty tool result projects
+ * to nothing. Three tiers, in order:
+ *
+ *  1. the bare-seq id (user turns, single-call assistants, text-bearing results);
+ *  2. the node's sub-ids in projection (= content) order — FIRST for a start
+ *     edge (the kernel must consume the whole node from its first sub-message),
+ *     LAST for an end edge (unreachable in practice: a node with open calls
+ *     makes every cut after it unbalanced, so it can never be a resolved end
+ *     edge);
+ *  3. the nearest message-bearing LIVE node between this edge and the opposite
+ *     edge (inclusive), walked along the SURFACE — never raw-id space, where
+ *     shadowed nodes keep their refs and would anchor onto already-compressed
+ *     messages. Walking inward only also guarantees the returned ref names a
+ *     message the transaction actually shadows; a span whose interior carries
+ *     no message at all (two adjacent empty results) yields undefined and the
+ *     caller raises the existing "no assigned ref" error.
+ */
+export declare function edgeRefForSeq(session: Session, byRaw: Readonly<Record<string, string>>, seq: number, role: 'start' | 'end', oppositeSeq: number): string | undefined;
 /**
  * Build the unified SearchDoc[] from the log: one block doc per ledger entry
  * (ref = compactionId, so `decompress({ blockId })` closes the loop) plus one

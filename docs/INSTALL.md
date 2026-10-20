@@ -11,7 +11,7 @@ mkdir -p ~/.dsh/profiles/web/node_modules
 ln -s /Users/yintianan/GitHub/billion-context-dsh ~/.dsh/profiles/web/node_modules/billion-context-dsh
 ```
 
-依赖说明：`dist/index.js` 内联了 acp-kernel，运行时把五个 seam 包 `@deepseek-ai/dsh-compaction`、`@deepseek-ai/dsh-session`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-settings` 作为**外部依赖**（由 `devDependencies` 提供并同时声明为 `peerDependencies`，`billion-context-dsh/node_modules` 已在解析链上）；`@deepseek-ai/cordis` 与 `@deepseek-ai/schemastery` 同为 peer。这五个 seam 包共享同一个 **peer 范围** `>=0.1.5-alpha.1 <0.1.6-0`——恰好是整条 `0.1.5` 线（所有预发布加最终 `0.1.5`）。从 `0.1.5` 线起，会话 replace 操作的协议字段由 `{ op, start, end }` 改名为 `{ op, startSeq, endSeq }` 且校验严格（只接受这三个字段）；本引擎只输出新形态，在更旧的 DSH（< 0.1.5）上每次 compress 都会被宿主在运行时拒绝（issue #136），因此旧版本不在兼容范围内——请先升级 DSH 再安装。显式区间（而非 caret）是有意为之：caret 会悄悄放进未经验证的 0.1.6+ 线。五个包一并声明为 peer（而非只声明 `dsh-compaction`），是为了让安装在 pnpm 的集成/封存布局下仍能把它们解析到**宿主自己的副本**，而不是某个与宿主不一致的陈旧嵌套副本。
+依赖说明：`dist/index.js` 内联了 acp-kernel，运行时把五个 seam 包 `@deepseek-ai/dsh-compaction`、`@deepseek-ai/dsh-session`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-settings` 作为**外部依赖**（由 `devDependencies` 提供并同时声明为 `peerDependencies`，`billion-context-dsh/node_modules` 已在解析链上）；`@deepseek-ai/cordis` 与 `@deepseek-ai/schemastery` 同为 peer。这五个 seam 包共享同一个 **peer 范围** `>=0.1.5-alpha.1 <0.2.2-0`——覆盖所有已验证的版本线：`0.1.5` 下限加已验证的 `0.1.6` / `0.1.7` / `0.2.0` / `0.2.1` 线（各线全部预发布加最终版）。从 `0.1.5` 线起，会话 replace 操作的协议字段由 `{ op, start, end }` 改名为 `{ op, startSeq, endSeq }` 且校验严格（只接受这三个字段）；本引擎只输出新形态，在更旧的 DSH（< 0.1.5）上每次 compress 都会被宿主在运行时拒绝（issue #136），因此旧版本不在兼容范围内——请先升级 DSH 再安装。显式区间（而非 caret）是有意为之：上界 `0.2.2-0` 挡住未经验证的下一版本线（`0.2.1-rc.2` 是当前生产宿主，2026-10-20 升级验证）（house rule；原上界 `0.1.6-0` 在 #190 逐线验证后放宽）。`0.2.0` 线还改了两处读取形状（工具结果调用 id 提升到消息级、新增 `developer/message` 工具注册表行），引擎按线读取、单一构建服务全区间（issue #192）。五个包一并声明为 peer（而非只声明 `dsh-compaction`），是为了让安装在 pnpm 的集成/封存布局下仍能把它们解析到**宿主自己的副本**，而不是某个与宿主不一致的陈旧嵌套副本。
 
 ### 方式 B：打包安装（发布前验证）
 
@@ -40,12 +40,12 @@ npm install --prefix ~/.dsh/profiles/web ./billion-context-dsh-0.2.1.tgz
 dsh plugin --profile web add billion-context-dsh
 ```
 
-装完重启 `dsh`（bundle 层在启动时组合）即生效：四个模型工具、`/acp` 命令、nudge、
+装完重启 `dsh`（bundle 层在启动时组合）即生效：四个模型工具、`/acp-prune` 命令、nudge、
 窗口自动探测默认全开，**无需手写任何组合行**。需要自定义 `config`（`modelContextLimit`
 / `prompts` / nudge 阈值）时，在 profile 的 `cordis.patch.yml` 里写一个**同 id**
 （`compaction-acp`）的行并附 `config:` 即可覆盖 bundle 默认行（见 §2 的例子）。
 六个标量键（`modelContextLimit` / `autoModelContextLimit` / nudge 三阈值 / `autoNudge`）
-还可以**运行时热调**：编辑 `~/.dsh/settings.yaml` 的 `compaction-acp` 段或用 `/acp config`
+还可以**运行时热调**：编辑 `~/.dsh/settings.yaml` 的 `compaction-acp` 段或用 `/acp-prune config`
 子命令，改动立即生效、无需重启（`settingsEnabled: false` 可整体关闭该集成——见 README
 「运行时设置」）。
 
@@ -74,7 +74,7 @@ dsh plugin --profile web add github:Tyan66666/billion-context-dsh#v0.2.19
 编辑 `~/.dsh/profiles/web/cordis.patch.yml`（你的 profile 的补丁文件），追加：
 
 ```yaml
-# ACP 作为全局压缩后端：四个模型工具 + `/acp` 命令 + nudge + ACP 提示词段，
+# ACP 作为全局压缩后端：四个模型工具 + `/acp-prune` 命令 + nudge + ACP 提示词段，
 # 对每个模式（standard / code / minimal / cordis / 自定义预设）都生效。
 # 通常应禁用 host 的 compaction-basic（同一 realm 内两个后端同时
 # provide `ctx.compaction` 会冲突），但注意：dsh 0.1.0-rc.6+ 上 web-app
@@ -111,7 +111,7 @@ dsh plugin --profile web add github:Tyan66666/billion-context-dsh#v0.2.19
         #     acpStatus: '报告 ACP 块账本：压缩块数、回收 token、当前上下文压力。'
 ```
 
-作用：host 平面注册 `ctx.compaction` + 四个模型工具 + `/acp` 命令 + `agent/pre-step` nudge 监听，所有模式共享一份。
+作用：host 平面注册 `ctx.compaction` + 四个模型工具 + `/acp-prune` 命令 + `agent/pre-step` nudge 监听，所有模式共享一份。
 
 注意：shipped 预设（standard / code / cordis）各自内部仍带着 realm 级 `dsh-compaction-basic` 兜底（shipped 安装不可改），所以这些模式里"自动压力压缩"仍由 basic 兜底，但 ACP 的 `compress` 工具、nudge、提示词段照常可用；minimal 与不带 compaction realm 的预设直接使用 host 的 ACP 引擎。
 
@@ -183,7 +183,7 @@ cd /Users/yintianan/GitHub/billion-context-dsh
 npm run typecheck && npm test && npm run build
 ```
 
-162 个测试覆盖：seam 挂载、窗口探测、CJK 感知 token 估算、消息投影、压缩事务（事件序列 + surface 遮蔽）、日志重建账本、四工具端到端、nudge 注入/去重/紧急绕过、可配置提示词模板与校验、**影子价格宿主词汇端到端**（真实 TokenMeter + SessionProjectionRegistry 复现 issue #54：claim == 宿主 meter 价、投影 messageTokens 非负、/acp compress resolved 边界、prune 宿主定价）、**T2 蒸馏可用性**（issue #60：nudge tier seqs 首尾直接压成 tier-2 块端到端；每次压缩结果都报告 tier——含 tier 1，无静默降级）。
+162 个测试覆盖：seam 挂载、窗口探测、CJK 感知 token 估算、消息投影、压缩事务（事件序列 + surface 遮蔽）、日志重建账本、四工具端到端、nudge 注入/去重/紧急绕过、可配置提示词模板与校验、**影子价格宿主词汇端到端**（真实 TokenMeter + SessionProjectionRegistry 复现 issue #54：claim == 宿主 meter 价、投影 messageTokens 非负、/acp-prune compress resolved 边界、prune 宿主定价）、**T2 蒸馏可用性**（issue #60：nudge tier seqs 首尾直接压成 tier-2 块端到端；每次压缩结果都报告 tier——含 tier 1，无静默降级）。
 
 ## 6. 回滚
 

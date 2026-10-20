@@ -13,8 +13,35 @@
 
 import type { CoreMessage } from 'acp-kernel'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
-import type { MessageSource } from '@deepseek-ai/dsh-llm'
 import { eventAtOf, sessionEventsOf } from './session-events.ts'
+import { decodeAcpBlockLedger } from './block-ledger.ts'
+
+// DSH ≥0.1.7's V4 session format admits producer-owned source kinds
+// ('plugin:<name>') and rejects the legacy wrapper shape
+// `{ kind: 'plugin', plugin: '<name>' }` (issue #163). dsh-llm's
+// MessageSourceMap predates V4 admission, so register this plugin's two
+// producer kinds on its documented merge-extensibility seam ("plugins add
+// their own kinds"). Type-level only — no runtime effect.
+// The target MUST be the package ROOT specifier '@deepseek-ai/dsh-llm' —
+// the same spelling dsh-compaction uses for its 'compact-checkpoint' member
+// (0.2.0 line). The map lives on the ROOT module as of the 0.2.0 line (the
+// `/message` subpath export is gone; dsh-compaction itself augments the
+// root), and under tsgo (typescript 7) augmenting the '/message' subpath
+// splits the MessageSourceMap symbol, so the host packages' root-spelled
+// augmentations stop merging into it and the checkpoint write fails
+// typecheck with TS2322. The root spelling is also what the pre-0.2.0 lines
+// need (measured green on the 0.1.5-rc.2 baseline too), so it is the one
+// spelling that serves every admitted line.
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    acpNudge: { kind: 'plugin:acp-nudge' }
+    acpPrune: { kind: 'plugin:billion-context-dsh' }
+    // V4 checkpoint producer kind (issue #181): emitted by checkpointSourceFor
+    // when the resolved dsh-compaction copy predates the host's v4 writer and
+    // its wrapper-shaped compactCheckpointSource() output is normalized.
+    compactCheckpoint: { kind: 'compact-checkpoint'; compactionId: string; sourceCommandId?: string }
+  }
+}
 
 /**
  * Extract plain text from a DSH content block array or string.
@@ -24,6 +51,27 @@ import { eventAtOf, sessionEventsOf } from './session-events.ts'
  * the actual `text` blocks, so a top-level-only walk would drop every tool
  * result from the projection (and with it the seq's ref assignment, breaking
  * compress boundary resolution). Nested arrays are flattened depth-first.
+ *
+ * That nesting is the PRE-0.2.0 shape. On the 0.2.0 seam line a tool result is
+ * a first-class ToolResultMessage whose content blocks are plain
+ * text/image/file blocks — nothing to unwrap — so the recursive branch simply
+ * finds the text one level up. It stays because this engine supports every
+ * line in its declared peer range, and a top-level-only walk would silently
+ * drop text on the older ones.
+ *
+ * Non-text blocks that the provider still bills for render as a deterministic
+ * one-line placeholder instead of vanishing (issue #117). An `image`/`file`
+ * block used to contribute nothing, which silently made a picture-only user
+ * message — or a tool result carrying a screenshot — invisible to the engine:
+ * no ref (so no compress boundary), `anchorsRangeEdge` false (so the range
+ * solver shrank past it and swallowed neighbours), invisible to the kernel's
+ * recent/last-user protection (so the last real user turn could be compressed
+ * away), priced at zero tokens, and absent from search/decompress output. The
+ * host itself projects non-text references to deterministic handle text for
+ * files ("request assembly projects every occurrence to deterministic handle
+ * text", dsh-llm/lib/types/types.d.ts), and this is the same idea one layer
+ * down. Only durable attachment metadata is used, so the placeholder is stable
+ * across turns (cache prefix, summary text, search hits).
  */
 export function extractText(content: unknown): string {
   if (typeof content === 'string') return content
@@ -31,14 +79,47 @@ export function extractText(content: unknown): string {
   const parts: string[] = []
   for (const block of content) {
     if (block === null || typeof block !== 'object') continue
-    const b = block as { type?: unknown; text?: unknown; content?: unknown }
+    const b = block as { type?: unknown; text?: unknown; content?: unknown; attachment?: unknown }
     if (b.type === 'text' && typeof b.text === 'string') {
       parts.push(b.text)
+    } else if (b.type === 'image' || b.type === 'file') {
+      const placeholder = attachmentPlaceholder(b.type, b.attachment)
+      if (placeholder !== null) parts.push(placeholder)
     } else if (Array.isArray(b.content)) {
       parts.push(extractText(b.content))
     }
   }
   return parts.join('\n')
+}
+
+/** Byte size as a short human string — deterministic, never locale-dependent. */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`
+}
+
+/**
+ * One-line stand-in for an image/file block. Reads only durable attachment
+ * metadata (media type, pixel size, byte length, display name) — never bytes,
+ * paths or URLs — so the text is safe to feed back as a summary, to search,
+ * and to send to the provider.
+ */
+function attachmentPlaceholder(type: 'image' | 'file', attachment: unknown): string | null {
+  if (attachment === null || typeof attachment !== 'object') return null
+  const a = attachment as {
+    mediaType?: unknown
+    width?: unknown
+    height?: unknown
+    bytes?: unknown
+    name?: unknown
+  }
+  const name = typeof a.name === 'string' && a.name.length > 0 ? a.name : undefined
+  const size = typeof a.bytes === 'number' && Number.isFinite(a.bytes) ? ` ${formatBytes(a.bytes)}` : ''
+  if (type === 'file') return `[file ${name ?? 'attachment'}${size}]`
+  const mediaType = typeof a.mediaType === 'string' && a.mediaType.length > 0 ? a.mediaType : 'image'
+  const dimensions = typeof a.width === 'number' && typeof a.height === 'number' ? ` ${a.width}x${a.height}` : ''
+  return `[image ${mediaType}${name ? ` ${name}` : ''}${dimensions}${size}]`
 }
 
 interface ToolCallBlock {
@@ -48,7 +129,14 @@ interface ToolCallBlock {
   arguments?: unknown
 }
 
-function toolCallsOf(content: unknown): ToolCallBlock[] {
+/**
+ * The tool-call blocks of one assistant content array, in CONTENT order.
+ * Shared with the range-edge layer (src/region.ts `anchorsRangeEdge`,
+ * src/tools.ts `edgeRefForSeq`): projection order IS this order (projectEvent
+ * maps the calls in sequence), so "the node's first/last sub-message id" is
+ * derivable from it without re-implementing the filter anywhere else.
+ */
+export function toolCallsOf(content: unknown): ToolCallBlock[] {
   if (!Array.isArray(content)) return []
   return content.filter((b): b is ToolCallBlock => (b as { type?: string }).type === 'tool-call')
 }
@@ -66,20 +154,30 @@ function stringifyArgs(args: unknown): string {
 /**
  * The tool-call id of one tool/result surface message, or null.
  *
- * Real DSH tool-result events carry NO `message.toolCallId` (hard-won rule
- * 10): the identity lives in the nested `{ type: 'tool-result', toolCallId }`
- * content block, falling back to `message.source.callId`. Shared with
- * `src/region.ts`'s call/result pairing — one implementation, never a copy.
+ * Three durable locations, in priority order (hard-won rule 10): the
+ * MESSAGE-level `toolCallId` field (written by dsh-llm's createToolResultMessage
+ * on the 0.1.7+ lines), the nested `{ type: 'tool-result', toolCallId }`
+ * content block, then `message.source.callId` (present on every line). A real
+ * event carries at least two of the three; the order only matters for
+ * fixtures that set a subset. Shared with `src/region.ts`'s call/result
+ * pairing — one implementation, never a copy.
  */
 export function toolCallIdOfResultEvent(event: SessionEvent): string | null {
   if (event.type !== 'tool/result') return null
-  const message = (event.data as {
-    message?: { content?: Array<{ type?: unknown; toolCallId?: unknown }>; source?: { callId?: unknown } }
+  // Structural read through `unknown`: the typed event data names dsh-llm's
+  // ContentBlock union (readonly, toolCallId only on some members), which no
+  // single straight assertion overlaps with across seam lines.
+  const message = (event.data as unknown as {
+    message?: {
+      toolCallId?: unknown
+      content?: Array<{ type?: unknown; toolCallId?: unknown }>
+      source?: { callId?: unknown }
+    }
   }).message
   const block = Array.isArray(message?.content)
     ? message.content.find((candidate) => candidate?.type === 'tool-result')
     : undefined
-  const id = block?.toolCallId ?? message?.source?.callId
+  const id = message?.toolCallId ?? block?.toolCallId ?? message?.source?.callId
   return typeof id === 'string' ? id : null
 }
 
@@ -129,10 +227,77 @@ export function buildToolCallIndex(events: readonly SessionEvent[]): ReadonlyMap
 export const SUMMARY_FRAME_PREFIX = '[Model-written summary — not user words; re-verify any obligations before relying on them]'
 
 export function withSummaryFramePrefix(text: string): string {
-  return text.startsWith(SUMMARY_FRAME_PREFIX) ? text : `${SUMMARY_FRAME_PREFIX}\n${text}`
+  if (text.startsWith(SUMMARY_FRAME_PREFIX)) return text
+  // Engine-written summaries are exempt: the frame claims a provenance they do
+  // not have ("Model-written …"). Deciding that HERE — in the one function the
+  // creation write (region.ts `prefixSummaryBlocks`) and the projection net
+  // (`projectEvent`) both go through — keeps the durable text and the
+  // model-visible text identical by construction, instead of by two call-site
+  // conditions that drift apart.
+  if (isEngineWrittenSummary(text)) return text
+  return `${SUMMARY_FRAME_PREFIX}\n${text}`
 }
 
-export function projectEvent(event: SessionEvent, toolNames?: ReadonlyMap<string, string>): CoreMessage[] {
+/**
+ * The lead-in of a summary the ENGINE writes itself — today only the
+ * context-overflow emergency marker (src/index.ts `compactForOverflow`).
+ * Recognition is by content, not by caller: the writer and both framing sites
+ * share this ONE literal.
+ */
+export const ENGINE_SUMMARY_LEAD = '[engine-written summary — context-overflow emergency compaction'
+
+export function isEngineWrittenSummary(text: string): boolean {
+  return text.startsWith(ENGINE_SUMMARY_LEAD)
+}
+
+/**
+ * The block summary the automatic overflow recovery writes. It is the engine's
+ * own note — not model-written text, not user words — saying which range was
+ * hidden to get the request under the window and where the originals still
+ * live (the append-only log: search_context/decompress rebuild from it).
+ */
+export function overflowMarkerSummary(hiddenCount: number): string {
+  return `${ENGINE_SUMMARY_LEAD}: ${hiddenCount} surface message(s) hidden because the provider rejected the request as exceeding the context window. The originals are intact in the session log — use search_context or decompress (see acp_status) to read them, or re-run the compress tool over this range to write a proper summary.]`
+}
+
+/**
+ * Kernel block id per compaction id, read from the durable block ledger.
+ *
+ * The kernel needs the block id on every host-carried checkpoint message:
+ * `CoreMessage.summaryOfBlockId` tells it that this message is the host's own
+ * rendering of a compression block, so a PLAIN message-ref range does not
+ * supersede that block — the kernel keeps the carrier visible and says so in
+ * its warning list (upstream #335, adopted with the 0.0.101 pin). A carrier of
+ * an inactive or unknown block folds normally, so an absent/legacy id degrades
+ * to the pre-#335 behavior instead of over-protecting.
+ *
+ * The join key (the `compaction/summary` `compactionId`) and the two accepted
+ * field locations (rawOutput-embedded payload, then the legacy top-level
+ * member) mirror `rebuildBlockLedger` in src/region.ts. That twin cannot be
+ * called from here: the region layer imports this module, so the dependency
+ * would cycle. `tests/checkpoint-span.test.ts` pins the two in lockstep.
+ */
+export function kernelBlockIdByCompactionId(
+  events: readonly SessionEvent[],
+): ReadonlyMap<string, string> {
+  const map = new Map<string, string>()
+  for (const event of events) {
+    if (event.type !== 'compaction/summary') continue
+    const data = event.data as { compactionId?: unknown; rawOutput?: unknown; kernelBlockId?: unknown }
+    const compactionId = typeof data.compactionId === 'string' ? data.compactionId : null
+    if (compactionId === null) continue
+    const embedded = decodeAcpBlockLedger(data.rawOutput).kernelBlockId
+    const kernelBlockId = embedded ?? (typeof data.kernelBlockId === 'string' ? data.kernelBlockId : null)
+    if (kernelBlockId !== null && kernelBlockId !== undefined) map.set(compactionId, kernelBlockId)
+  }
+  return map
+}
+
+export function projectEvent(
+  event: SessionEvent,
+  toolNames?: ReadonlyMap<string, string>,
+  kernelBlockIds?: ReadonlyMap<string, string>,
+): CoreMessage[] {
   switch (event.type) {
     case 'user/message': {
       const raw = extractText((event.data as { content?: unknown }).content)
@@ -140,7 +305,16 @@ export function projectEvent(event: SessionEvent, toolNames?: ReadonlyMap<string
       // framing already covers new blocks; this catches legacy blocks whose nodes
       // were written before the feature existed).
       const text = isCheckpointNode(event) ? withSummaryFramePrefix(raw) : raw
-      return text.length > 0 ? [{ id: String(event.seq), role: 'user', contentType: 'text', text }] : []
+      if (text.length === 0) return []
+      const compactionId = isCheckpointNode(event) ? checkpointCompactionIdOf(event) : null
+      const summaryOfBlockId = compactionId === null ? undefined : kernelBlockIds?.get(compactionId)
+      return [{
+        id: String(event.seq),
+        role: 'user',
+        contentType: 'text',
+        text,
+        ...(summaryOfBlockId === undefined ? {} : { summaryOfBlockId }),
+      }]
     }
     case 'assistant/message': {
       const content = (event.data as { message?: { content?: unknown } }).message?.content
@@ -198,7 +372,15 @@ export function projectEvent(event: SessionEvent, toolNames?: ReadonlyMap<string
 export function eventsToCoreMessages(events: readonly SessionEvent[], toolNames?: ReadonlyMap<string, string>): CoreMessage[] {
   const index = toolNames ?? buildToolCallIndex(events)
   const out: CoreMessage[] = []
-  for (const event of events) out.push(...projectEvent(event, index))
+  // The compactionId → block-id map is built LAZILY: a session with no
+  // checkpoint carrier on its surface pays nothing, and a session with them
+  // pays one pass over the log (the numbers only matter for the checkpoint
+  // branch of projectEvent).
+  let kernelBlockIds: ReadonlyMap<string, string> | null = null
+  for (const event of events) {
+    if (kernelBlockIds === null && isCheckpointNode(event)) kernelBlockIds = kernelBlockIdByCompactionId(events)
+    out.push(...projectEvent(event, index, kernelBlockIds ?? undefined))
+  }
   return out
 }
 
@@ -234,19 +416,107 @@ export function extractEventText(event: SessionEvent): string {
   }
 }
 
+/** Count image/file blocks reachable from a content payload (same walk as extractText). */
+export function countAttachmentBlocks(content: unknown): { images: number; files: number } {
+  const counts = { images: 0, files: 0 }
+  countAttachments(content, counts)
+  return counts
+}
+
+function countAttachments(content: unknown, counts: { images: number; files: number }): void {
+  if (!Array.isArray(content)) return
+  for (const block of content) {
+    if (block === null || typeof block !== 'object') continue
+    const b = block as { type?: unknown; content?: unknown }
+    if (b.type === 'image') counts.images += 1
+    else if (b.type === 'file') counts.files += 1
+    else if (Array.isArray(b.content)) countAttachments(b.content, counts)
+  }
+}
+
+/**
+ * Attachments carried by one surface event, walked exactly like
+ * `extractEventText`. Used in two places: the compressible-range rows mark
+ * media-bearing spans, and the callers that already own a token meter price
+ * those spans with the provider-anchored media price instead of the text-only
+ * estimate (issue #117).
+ */
+export function attachmentsOfEvent(event: SessionEvent): { images: number; files: number } {
+  return countAttachmentBlocks(contentBlocksOfEvent(event))
+}
+
+/**
+ * The image/file blocks themselves (not just their counts), in document order.
+ * The compressible-range rows price these with the fixed-heuristic media price
+ * when the meter reports no routed surcharge, so a media-bearing span is never
+ * shown as free (issue #117).
+ */
+export function mediaBlocksOfEvent(event: SessionEvent): readonly unknown[] {
+  const blocks: unknown[] = []
+  collectMediaBlocks(contentBlocksOfEvent(event), blocks)
+  return blocks
+}
+
+function collectMediaBlocks(content: unknown, out: unknown[]): void {
+  if (!Array.isArray(content)) return
+  for (const block of content) {
+    if (block === null || typeof block !== 'object') continue
+    const b = block as { type?: unknown; content?: unknown }
+    if (b.type === 'image' || b.type === 'file') out.push(block)
+    else if (Array.isArray(b.content)) collectMediaBlocks(b.content, out)
+  }
+}
+
+/** Where one surface event keeps its typed content blocks (never text). */
+function contentBlocksOfEvent(event: SessionEvent): unknown {
+  switch (event.type) {
+    case 'user/message':
+      return (event.data as { content?: unknown }).content
+    case 'assistant/message':
+    case 'tool/result':
+      return (event.data as { message?: { content?: unknown } }).message?.content
+    default:
+      return undefined
+  }
+}
+
 /**
  * Whether a surface user message is a compaction checkpoint node (already
  * compressed). Defined here (not in region.ts) so the classifier below and
  * region.ts share ONE implementation.
+ *
+ * Recognizes BOTH host shapes (issue #168): the ≤0.1.6 wrapper
+ * `{ kind: 'plugin', plugin: 'compact', compactionId }` and the 0.1.7+
+ * producer-owned kind `{ kind: 'compact-checkpoint', compactionId }` written
+ * by dsh-compaction's `compactCheckpointSource()` (verified against the
+ * published 0.1.7-alpha.1 artifact: the marker object is exactly
+ * `{ kind: 'compact-checkpoint' }` plus `compactionId` and an optional
+ * `sourceCommandId`). The 0.1.7 V3→V4 migration rewrites pre-0.1.7 sessions
+ * to the new shape, so both shapes coexist on one surface and both must be
+ * recognized — a row that misses this predicate classifies as `real`, which
+ * double-counts its summary text in acp_status, can steal the protected-tail
+ * window, and hides it from every distillation entry point below.
  */
 export function isCheckpointNode(event: SessionEvent): boolean {
   if (event.type !== 'user/message') return false
   const source = (event.data as { source?: { kind?: string; plugin?: string } }).source
-  // 0.1.7 stamps `{ kind: 'compact-checkpoint' }`; 0.1.5 stamped
-  // `{ kind: 'plugin', plugin: 'compact' }`. Both are read: sessions committed
-  // before the upgrade still carry the legacy row, and a checkpoint that stops
-  // classifying as one becomes foldable — distillation is an explicit act.
-  return source?.kind === 'compact-checkpoint' || source?.plugin === 'compact'
+  return source?.plugin === 'compact' || source?.kind === 'compact-checkpoint'
+}
+
+/**
+ * The durable compaction id stamped on a checkpoint summary node, reading BOTH
+ * host shapes (see {@link isCheckpointNode}). Returns null when the event is
+ * not a checkpoint node or carries no id — a malformed row still CLASSIFIES
+ * as a checkpoint (it must never read as real content) but has no block to
+ * link to. Single shared extractor for the ledger index (`summarySeqIndex`),
+ * the distill-edge resolver (`blockRefForSummarySeq`) and the decompress
+ * recursion (`checkpointBlockIdOf`) — those sites must not re-derive the shape
+ * check themselves (issue #168).
+ */
+export function checkpointCompactionIdOf(event: SessionEvent): string | null {
+  if (!isCheckpointNode(event)) return null
+  const source = (event.data as { source?: { compactionId?: unknown } }).source
+  return typeof source?.compactionId === 'string' ? source.compactionId : null
 }
 
 /**
@@ -255,64 +525,38 @@ export function isCheckpointNode(event: SessionEvent): boolean {
  * predicates that drift apart).
  *
  * - `real` — genuine conversation content (user turns without an injected
- *   source, assistant prose/tool-calls, tool results, sub-agent relay rows).
- *   This is the only class that may win "last real user message" protection
- *   (minus relay rows, see `isRealUserTurn`).
+ *   source, assistant prose/tool-calls, tool results, sub-agent relay rows,
+ *   and host content channels in BOTH spellings: legacy plugin names and the
+ *   DSH >= 0.1.7 direct-kind renames, issue #169). EXCEPTION: skill-catalog
+ *   rows carrying the `<available_skills>` marker stay `instruction` even
+ *   when their source shape is unusable (issue #185) — folding one loses
+ *   skill discovery permanently. This is the only class that may win "last
+ *   real user message" protection (minus all non-user rows, see
+ *   `isRealUserTurn`).
  * - `metadata` — the engine's own ephemeral rows: nudge echoes and
  *   compress-pair replacement stubs. Their content is derived from
  *   already-visible messages, so folding them into an adjacent real segment
  *   is zero-loss — this preserves main's behavior for engine-authored rows.
- * - `checkpoint` — compaction summary nodes (`plugin: 'compact'`).
+ * - `checkpoint` — compaction summary nodes (both host shapes, see
+ *   `isCheckpointNode`: legacy `plugin: 'compact'` and 0.1.7+
+ *   `kind: 'compact-checkpoint'`, issue #168).
  *   Distillation is an explicit act; never folded into any segment.
  * - `instruction` — host-authored policy/instructions: AGENTS.md injections
- *   (both host shapes), skill catalogs, and ANY unknown `kind:'plugin'` row.
- *   Folding these is unsafe (the model would lose live policy text, and the
- *   host re-injects the current AGENTS.md copy when it disappears — the
- *   compress → re-inject loop this PR fixes). Unknown plugin names fall here
- *   deliberately: a future host injection must never silently become
- *   compressible content.
+ *   (both host shapes), skill catalogs, host compaction summary rows
+ *   (`compact-basic`, issue #169), and ANY unknown `kind:'plugin'` row or
+ *   unaudited direct kind. Folding these is unsafe (the model would lose
+ *   live policy text, and the host re-injects the current AGENTS.md copy
+ *   when it disappears — the compress → re-inject loop this PR fixes).
+ *   Unknown channel names fall here deliberately in BOTH namespaces: a
+ *   future host injection must never silently become compressible content.
  */
 export type SurfaceEventClass = 'real' | 'metadata' | 'checkpoint' | 'instruction'
 
-/**
- * Plugin names the engine itself authors — safe to fold into real segments.
- * LEGACY shape only: 0.1.5 wrote `{ kind: 'plugin', plugin }`, which 0.1.7's
- * `assertV4SourceRowAdmission` now refuses, so this set exists to READ rows
- * already committed and never to author new ones. New writes carry the
- * producer-owned kind instead (see {@link engineSource}).
- */
+/** Plugin names the engine itself authors — safe to fold into real segments. */
 export const METADATA_PLUGINS: ReadonlySet<string> = new Set([
   'acp-nudge', // nudge echo (src/nudge.ts)
   'billion-context-dsh', // compress-pair replacement stub (src/region.ts)
 ])
-
-/**
- * Producer-owned kinds for the same engine-authored rows, keyed the way 0.1.7
- * records them. `MessageSource.kind` answers *who produced this*, and the
- * format refuses the generic `{ kind: 'plugin', plugin }` wrapper outright
- * (`format v4 message requires a producer-owned source kind`). Kept in step
- * with {@link METADATA_PLUGINS} by {@link engineSource}, which is the only
- * writer.
- */
-export const METADATA_KINDS: ReadonlySet<string> = new Set([
-  'acp-nudge',
-  'billion-context-dsh',
-])
-
-/**
- * Build the `source` for one engine-authored injected row. The single writer
- * for {@link METADATA_KINDS}, so a kind can never be authored that the
- * classifier below does not recognise as engine metadata.
- *
- * The assertion covers 0.1.5's `MessageSourceMap`, which has no member for a
- * plugin-owned kind. Both versions type `MessageSource` as
- * `MessageSourceMap[keyof MessageSourceMap]` — an OPEN interface — and both
- * pass `user/message` rows through their runtime validation, so the value is
- * legal at run time in either version; only the pre-0.1.7 type needs the cast.
- */
-export function engineSource(kind: 'acp-nudge' | 'billion-context-dsh', form: string): MessageSource {
-  return { kind, form } as unknown as MessageSource
-}
 
 /**
  * Host plugins whose rows are real CONTENT, not policy: folding them reclaims
@@ -334,68 +578,167 @@ const REAL_CONTENT_PLUGINS: ReadonlySet<string> = new Set([
 ])
 
 /**
- * The same host content rows under their 0.1.7 producer-owned kinds. The
- * upgrade renamed every one of them, so keying only on the legacy names would
- * misfile each as an unknown policy row — snapshot rows would stop folding and
- * the protection window would refuse them for the wrong reason.
- * Names come from the format's own migration tables (`RENAMED_PRODUCERS` for
- * the three that changed, `RELEASED_SAME_NAME_PRODUCERS` for the rest).
- *  - 'runtime-context' — was '@deepseek-ai/dsh-system-prompt'
- *  - 'ptc-mode' — was 'tools-ptc' / 'tools-code-mode'
- *  - 'user-approval' — unchanged name, new kind
+ * DSH >= 0.1.7 (V4 format) renames the SAME host channels out of the plugin
+ * namespace into DIRECT kinds without any plugin field (the V3→V4 migration's
+ * rename map, audited from @deepseek-ai/dsh-session-persistence-jsonl
+ * 0.1.7-alpha.1): '@deepseek-ai/dsh-system-prompt' -> 'runtime-context',
+ * 'tools-ptc'/'tools-code-mode' -> 'ptc-mode'. Pre-migration logs keep the
+ * legacy plugin shape, so both spellings must classify identically
+ * (issue #169). Same semantics as their plugin counterparts: real content,
+ * foldable, never the user speaking.
  */
 const REAL_CONTENT_KINDS: ReadonlySet<string> = new Set([
-  'runtime-context',
-  'ptc-mode',
-  'user-approval',
+  'runtime-context', // dynamic-context snapshot (was '@deepseek-ai/dsh-system-prompt')
+  'ptc-mode', // deferred tool context (was 'tools-ptc' / 'tools-code-mode')
+])
+
+/** Audited relay kinds: not the user speaking, but genuine conversation content. */
+const AUDITED_RELAY_KINDS: ReadonlySet<string> = new Set([
+  'subagent-report',
+  'subagent-settled',
 ])
 
 /** Known host policy kinds that must never be folded (safe-listing beyond `plugin`). */
 const HOST_INSTRUCTION_KINDS: ReadonlySet<string> = new Set([
   'agent-instructions', // AGENTS.md injection (hook shape: {kind:'agent-instructions', form:'instructions'})
   'skill-catalog', // skill catalog (form:'catalog')
+  // Host compaction summary row (DSH >= 0.1.7; was plugin 'dsh-compaction-basic').
+  // That legacy name was never whitelisted, so its rows were barriers already —
+  // the renamed spelling keeps exactly that treatment instead of silently
+  // becoming foldable content (issue #169).
+  'compact-basic',
 ])
 
 /**
- * True for AGENTS.md instruction rows in BOTH host shapes: the hook shape
- * (`kind:'agent-instructions'`, form 'instructions') and the baseline shape
- * (`kind:'plugin'` + plugin 'agent-instructions'). Shared by the newest-row
- * scan and the range scanner so protection and folding always agree on what
- * counts as an AGENTS.md row.
+ * Resolve the owning plugin name from either durable source shape: the legacy
+ * V3 wrapper `{ kind: 'plugin', plugin: '<name>' }` or the V4 producer kind
+ * `'plugin:<name>'`. DSH 0.1.7's V3→V4 migration rewrites every unregistered
+ * plugin row into the latter on file open, so both shapes coexist on a live
+ * surface until a session has been fully rewritten (issue #163). Returns
+ * undefined when neither shape is present, or when the name is missing,
+ * non-string, or empty — callers then keep their conservative fallback.
+ */
+export function sourcePluginOf(
+  source: { kind?: unknown; plugin?: unknown } | undefined,
+): string | undefined {
+  if (source === undefined || typeof source !== 'object') return undefined
+  const kind = source.kind
+  if (kind === 'plugin') {
+    return typeof source.plugin === 'string' && source.plugin.length > 0 ? source.plugin : undefined
+  }
+  if (typeof kind === 'string' && kind.startsWith('plugin:')) {
+    const name = kind.slice('plugin:'.length)
+    return name.length > 0 ? name : undefined
+  }
+  return undefined
+}
+
+/**
+ * True for AGENTS.md instruction rows in ALL host shapes: the hook shape
+ * (`kind:'agent-instructions'`, form 'instructions'), the legacy V3 wrapper
+ * (`kind:'plugin'` + plugin 'agent-instructions'), and the V4 producer kind
+ * (`kind:'plugin:agent-instructions'`) that DSH 0.1.7's migration rewrites
+ * legacy rows into on file open (issue #163) — a migrated session must keep
+ * its newest-row pin, or the current copy becomes foldable and the
+ * compress → re-inject loop returns. Shared by the newest-row scan and the
+ * range scanner so protection and folding always agree on what counts as an
+ * AGENTS.md row.
  */
 export function isAgentInstructionsRow(event: SessionEvent): boolean {
   if (event.type !== 'user/message') return false
   const source = (event.data as { source?: { kind?: string; plugin?: string } }).source
   if (!source) return false
-  return source.kind === 'agent-instructions' || (source.kind === 'plugin' && source.plugin === 'agent-instructions')
+  return source.kind === 'agent-instructions' || sourcePluginOf(source) === 'agent-instructions'
+}
+
+/**
+ * True for skill-catalog rows (issue #185) — the `<available_skills>` list the
+ * harness injects (dsh-tool-skill's `agent/pre-step`) so the model knows which
+ * skills are installed. Recognized in every known host shape:
+ *
+ * - the direct kind `{ kind: 'skill-catalog', form: 'catalog' }` (audited;
+ *   already in HOST_INSTRUCTION_KINDS);
+ * - the plugin shapes, legacy wrapper `{ kind: 'plugin', plugin:
+ *   'dsh-tool-skill' }` and V4 producer kind `plugin:dsh-tool-skill`
+ *   (unknown plugin names already fall to instruction — naming the channel
+ *   explicitly pins it there so a future REAL_CONTENT_PLUGINS entry can never
+ *   silently re-admit the catalog as foldable content);
+ * - CONTENT FALLBACK: any user row whose text carries the `<available_skills>`
+ *   marker, whatever its source shape. Hosts that inject the catalog through a
+ *   plain user message with NO usable source marker (the wild shape behind
+ *   issue #185) would otherwise classify as `real`, get offered in the nudge
+ *   range table, and be folded away. Folding the visible catalog is NOT
+ *   recoverable by the host: dsh-tool-skill's resend gate is the catalog
+ *   DIGEST, and shadowing the visible row changes nothing about it, so the
+ *   model loses skill discovery until the catalog actually changes. The
+ *   marker is the stable contract between harness and model; a user who pastes
+ *   it into a chat turn becomes a barrier for that one row (harmless), while
+ *   folding a real catalog is a permanent capability loss (not harmless) —
+ *   the asymmetry decides.
+ */
+export function isSkillCatalogRow(event: SessionEvent): boolean {
+  if (event.type !== 'user/message') return false
+  const source = (event.data as { source?: { kind?: unknown; plugin?: unknown } }).source
+  if (source?.kind === 'skill-catalog') return true
+  if (sourcePluginOf(source) === 'dsh-tool-skill') return true
+  return extractText(contentBlocksOfEvent(event)).includes('<available_skills>')
 }
 
 export function classifySurfaceEvent(event: SessionEvent): SurfaceEventClass {
   // Compaction summary nodes first — they are user messages too.
   if (isCheckpointNode(event)) return 'checkpoint'
+  // developer/message (DSH >= 0.2.0): host-written tool-registry diff rows
+  // (tool-addition/tool-removal blocks, source { kind: 'tool-registry' }) —
+  // bookkeeping about the request header, not conversation content. Foldable
+  // like other host metadata: they carry no text in our projection and the
+  // host appends them once per header diff (no presence gate), so folding can
+  // never provoke a re-injection loop. They can never win user-turn
+  // protection either (that gate requires user/message).
+  //
+  // Read through a widened local: the 0.1.5/0.1.6 seam lines' event union has
+  // no such member, so a direct comparison would not typecheck against their
+  // types even though the runtime check is exactly what we want.
+  const eventType: string = event.type
+  if (eventType === 'developer/message') return 'metadata'
   // Assistant / tool events are always genuine content.
   if (event.type !== 'user/message') return 'real'
   const source = (event.data as { source?: { kind?: string; plugin?: string } }).source
-  if (!source) return 'real' // user turn written without a source: genuine content
+  // Skill-catalog rows must be caught even when the host injects them without
+  // a usable source marker — folding one loses skill discovery permanently
+  // (issue #185). Only the <available_skills> content fallback does real work
+  // on these paths; the predicate's source-shape checks are already decided
+  // here by construction.
+  if (!source) return isSkillCatalogRow(event) ? 'instruction' : 'real' // user turn written without a source: genuine content
   const kind = source.kind
-  if (kind === 'user') return 'real' // real user turn (host stamps {kind:'user'})
-  // Producer-owned kinds first: this is what 0.1.7 writes, and it is the only
-  // shape that reaches a new session's log at all.
-  if (kind !== undefined && METADATA_KINDS.has(kind)) return 'metadata'
-  if (kind !== undefined && REAL_CONTENT_KINDS.has(kind)) return 'real'
-  // Legacy `kind:'plugin'` — read-only path for rows committed by 0.1.5.
-  if (kind === 'plugin') {
-    if (source.plugin !== undefined && METADATA_PLUGINS.has(source.plugin)) return 'metadata'
-    if (source.plugin !== undefined && REAL_CONTENT_PLUGINS.has(source.plugin)) return 'real'
+  if (kind === 'user') return isSkillCatalogRow(event) ? 'instruction' : 'real' // real user turn (host stamps {kind:'user'})
+  // Plugin-attributed rows arrive in two shapes: the legacy V3 wrapper
+  // `{ kind: 'plugin', plugin: '<name>' }` and the V4 producer kind
+  // `'plugin:<name>'` that DSH 0.1.7's V3→V4 migration rewrites every
+  // unregistered plugin row into on file open (issue #163). Both classify by
+  // the SAME name table; a legacy wrapper without a parseable name stays
+  // conservative (instruction), exactly as before this change.
+  const plugin = sourcePluginOf(source)
+  if (kind === 'plugin' || plugin !== undefined) {
+    if (plugin !== undefined && METADATA_PLUGINS.has(plugin)) return 'metadata'
+    if (plugin !== undefined && REAL_CONTENT_PLUGINS.has(plugin)) return 'real'
     // Unknown plugin names are policy rows until proven otherwise: a future
     // presence-driven injection must never silently become compressible.
     return 'instruction'
   }
-  if (kind !== undefined && HOST_INSTRUCTION_KINDS.has(kind)) return 'instruction'
-  // Sub-agent relay rows and any future kind: treat as real content for
-  // compressibility, but they must not win "last real user message" protection
-  // (see isRealUserTurn) — a relay is not the user speaking.
-  return 'real'
+  // Direct kinds (no plugin field). DSH >= 0.1.7's rename map moves host
+  // channels out of the plugin namespace into direct kinds (issue #169), so
+  // the conservative default must hold here too: only AUDITED kinds are real
+  // content; everything else is a barrier until proven otherwise. A row whose
+  // source carries no usable kind keeps its pre-0.1.7 treatment (real) —
+  // except skill-catalog rows, which must be caught regardless of shape
+  // (issue #185, see above).
+  if (typeof kind !== 'string') return isSkillCatalogRow(event) ? 'instruction' : 'real'
+  if (HOST_INSTRUCTION_KINDS.has(kind)) return 'instruction'
+  if (REAL_CONTENT_KINDS.has(kind) || AUDITED_RELAY_KINDS.has(kind)) return 'real'
+  // Unaudited direct kind: a future host channel must never silently become
+  // compressible content or win user-turn protection (rule 16) — same default
+  // as unknown plugin names above.
+  return 'instruction'
 }
 
 /**
@@ -415,7 +758,12 @@ export function isRealUserTurn(event: SessionEvent): boolean {
   // Host content rows that are NOT the user speaking (dynamic-context snapshot,
   // approval notice, deferred tool context): foldable, but they must never win
   // the protection window — that is exactly the bug class issue #71 fixes.
-  if (source?.plugin !== undefined && REAL_CONTENT_PLUGINS.has(source.plugin)) return false
-  if (source?.kind !== undefined && REAL_CONTENT_KINDS.has(source.kind)) return false
-  return source?.kind !== 'subagent-report' && source?.kind !== 'subagent-settled'
+  // Legacy plugin shapes resolve through sourcePluginOf (issue #163); DSH
+  // >= 0.1.7 renames the same channels to direct kinds without any plugin
+  // field (issue #169) — REAL_CONTENT_KINDS covers those spellings.
+  const plugin = sourcePluginOf(source)
+  if (plugin !== undefined && REAL_CONTENT_PLUGINS.has(plugin)) return false
+  const kind = source?.kind
+  if (typeof kind === 'string' && REAL_CONTENT_KINDS.has(kind)) return false
+  return kind !== 'subagent-report' && kind !== 'subagent-settled'
 }
