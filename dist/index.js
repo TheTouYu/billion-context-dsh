@@ -9315,7 +9315,14 @@ function compressText(env, agent, args) {
   const shadowed = shadowedSeqsOf(session, start, end);
   const instructionHits = guardedRowsInSpan(guardedSurfaceSeqsOf(session), shadowed);
   if (instructionHits.length > 0) {
-    return protectedRowRejectionNote(start, end, instructionHits, shadowed, session);
+    return protectedRowRejectionNote(
+      start,
+      end,
+      instructionHits,
+      shadowed,
+      session,
+      kernelConfigFor(env).compress.minCompressRange
+    );
   }
   const carriers = liveCheckpointCarriersInSpan(session, shadowed);
   if (carriers.length > 0) {

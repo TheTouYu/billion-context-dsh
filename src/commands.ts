@@ -148,7 +148,14 @@ function compressText(env: ToolEnvironment, agent: Agent, args: string[]): strin
   const shadowed = shadowedSeqsOf(session, start, end)
   const instructionHits = guardedRowsInSpan(guardedSurfaceSeqsOf(session), shadowed)
   if (instructionHits.length > 0) {
-    return protectedRowRejectionNote(start, end, instructionHits, shadowed, session)
+    return protectedRowRejectionNote(
+      start,
+      end,
+      instructionHits,
+      shadowed,
+      session,
+      kernelConfigFor(env).compress.minCompressRange,
+    )
   }
   // Same hard reject as the compress tool: this is a plain T1 range transaction,
   // so it must not fold the checkpoint carrier of a still-active block (the
