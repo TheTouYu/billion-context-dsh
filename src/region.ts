@@ -742,6 +742,14 @@ export interface SeqCompressibleRange {
   readonly end: number
   readonly count: number
   readonly tokens: number
+  /**
+   * Raw text characters in the span. The kernel's `minCompressRange` gate is
+   * measured in CHARS (acp-kernel#511: `totalRangeChars += msg.text.length`),
+   * so the host must price the same unit when it decides whether an offered
+   * table can pass the apply gate. Token counts alone cannot answer that
+   * (CJK ≈ 1 char/token, Latin ≈ 4 chars/token).
+   */
+  readonly chars: number
   /** Share of messages that are tool messages (tool-call or tool-result), 0-100 — kernel `toolPct` parity. */
   readonly toolPct: number
   /** Image blocks reachable inside the span (directly or through a tool result). */
@@ -1242,6 +1250,7 @@ interface CompressibleSegment {
   end: number
   count: number
   tokens: number
+  chars: number
   toolCount: number
   images: number
   files: number
@@ -1309,7 +1318,9 @@ function compressibleSegmentsOf(
     const mediaPrice = attachments.images + attachments.files > 0
       ? (mediaPriceOf?.(seq) ?? 0) + hostMediaStructuralPrice(mediaBlocksOfEvent(event))
       : 0
-    const tokens = defaultCountTokens(extractEventText(event)) + mediaPrice
+    const text = extractEventText(event)
+    const chars = text.length
+    const tokens = defaultCountTokens(text) + mediaPrice
     const isTool = isToolEvent(event)
     if (current === null) {
       current = {
@@ -1317,6 +1328,7 @@ function compressibleSegmentsOf(
         end: seq,
         count: 1,
         tokens,
+        chars,
         toolCount: isTool ? 1 : 0,
         images: attachments.images,
         files: attachments.files,
@@ -1326,6 +1338,7 @@ function compressibleSegmentsOf(
       current.end = Math.max(current.end, seq)
       current.count += 1
       current.tokens += tokens
+      current.chars += chars
       current.toolCount += isTool ? 1 : 0
       current.images += attachments.images
       current.files += attachments.files
@@ -1367,7 +1380,7 @@ function compressibleSegmentsOf(
 export function buildCompressibleSeqRanges(
   session: Session,
   kernelView: KernelRangeView,
-  opts: { preserveRecent?: number; mediaPriceOf?: MediaPriceOf } = {},
+  opts: { preserveRecent?: number; mediaPriceOf?: MediaPriceOf; minChars?: number } = {},
 ): SeqCompressibleRange[] {
   // Orphan tool messages corrupt the pairing balance cache and fragment every
   // large span. Prune them before mapping so the table reflects the surface
@@ -1393,6 +1406,16 @@ export function buildCompressibleSeqRanges(
       protectedSeqs,
       opts.mediaPriceOf,
     )
+    // A kernel range that the host guards break into pieces may end up with
+    // less usable text than the apply gate's minimum. Offering those pieces is
+    // a guaranteed rejection ("Total compressible content too small"), and a
+    // table that keeps re-offering them starves every later range: live
+    // session 4b71d96c re-sent the SAME 4,590-char six-piece set for 21 nudges
+    // while a 49,931-char tool result sat right behind it. Measure the SAME
+    // unit as the gate (chars) and drop the whole kernel range when even the
+    // sum cannot pass.
+    const totalChars = segments.reduce((sum, segment) => sum + segment.chars, 0)
+    if ((opts.minChars ?? 0) > 0 && totalChars < opts.minChars!) continue
     for (const segment of segments) {
       try {
         const { start, end } = resolveSurfaceRange(session, segment.start, segment.end)
@@ -1401,6 +1424,7 @@ export function buildCompressibleSeqRanges(
           end,
           count: segment.count,
           tokens: segment.tokens,
+          chars: segment.chars,
           toolPct: segment.count > 0 ? Math.round((segment.toolCount / segment.count) * 100) : 0,
           images: segment.images,
           files: segment.files,

@@ -6720,13 +6720,43 @@ var METADATA_PLUGINS = /* @__PURE__ */ new Set([
 var REAL_CONTENT_PLUGINS = /* @__PURE__ */ new Set([
   "@deepseek-ai/dsh-system-prompt",
   "user-approval",
-  "tools-ptc"
+  "tools-ptc",
+  // 2026-10-28 live audit (genshin-ts session 4b71d96c): these channels are
+  // CONTENT, not policy. They used to fall to 'instruction' only because they
+  // were not listed, which made 250 rows / 199K tokens un-compressible and
+  // split every compressible span. None of them has a presence gate that
+  // re-injects a folded row; the injector is driven by query/cadence, not by
+  // "the previous block disappeared". The newest copy of each stays inside
+  // the recent-tail guard, so folding an older copy cannot remove live recall.
+  "memo-river",
+  // passive recall + write-cadence blocks
+  "agent-message",
+  // teammate message relayed into the user stream
+  "time-context",
+  // clock snapshot (a new row every turn)
+  "skill-rec",
+  // skill recommendation nudge
+  "preset-composer",
+  // capability overview injected once
+  "repeat-tool-reminder"
+  // advisory emitted when the model repeats a tool call
 ]);
 var REAL_CONTENT_KINDS = /* @__PURE__ */ new Set([
   "runtime-context",
   // dynamic-context snapshot (was '@deepseek-ai/dsh-system-prompt')
-  "ptc-mode"
+  "ptc-mode",
   // deferred tool context (was 'tools-ptc' / 'tools-code-mode')
+  // Direct-kind spellings of the audited content channels above. `isRealUserTurn`
+  // subtracts this set from the "last real user" scan, so a foldable injection
+  // can never win the active-user-turn protection window.
+  "memo-river",
+  "agent-message",
+  "time-context",
+  "skill-rec",
+  "preset-composer",
+  "repeat-tool-reminder",
+  "user-approval"
+  // one-shot approval notice (direct-kind migration of the plugin row)
 ]);
 var AUDITED_RELAY_KINDS = /* @__PURE__ */ new Set([
   "subagent-report",
@@ -7473,7 +7503,9 @@ function compressibleSegmentsOf(session, fromIndex, toIndex, protectedSeqs, medi
     }
     const attachments = attachmentsOfEvent(event);
     const mediaPrice = attachments.images + attachments.files > 0 ? (mediaPriceOf?.(seq) ?? 0) + hostMediaStructuralPrice(mediaBlocksOfEvent(event)) : 0;
-    const tokens = defaultCountTokens(extractEventText(event)) + mediaPrice;
+    const text = extractEventText(event);
+    const chars = text.length;
+    const tokens = defaultCountTokens(text) + mediaPrice;
     const isTool = isToolEvent(event);
     if (current === null) {
       current = {
@@ -7481,6 +7513,7 @@ function compressibleSegmentsOf(session, fromIndex, toIndex, protectedSeqs, medi
         end: seq,
         count: 1,
         tokens,
+        chars,
         toolCount: isTool ? 1 : 0,
         images: attachments.images,
         files: attachments.files
@@ -7490,6 +7523,7 @@ function compressibleSegmentsOf(session, fromIndex, toIndex, protectedSeqs, medi
       current.end = Math.max(current.end, seq);
       current.count += 1;
       current.tokens += tokens;
+      current.chars += chars;
       current.toolCount += isTool ? 1 : 0;
       current.images += attachments.images;
       current.files += attachments.files;
@@ -7518,6 +7552,8 @@ function buildCompressibleSeqRanges(session, kernelView, opts = {}) {
       protectedSeqs,
       opts.mediaPriceOf
     );
+    const totalChars = segments.reduce((sum, segment) => sum + segment.chars, 0);
+    if ((opts.minChars ?? 0) > 0 && totalChars < opts.minChars) continue;
     for (const segment of segments) {
       try {
         const { start, end } = resolveSurfaceRange(session, segment.start, segment.end);
@@ -7526,6 +7562,7 @@ function buildCompressibleSeqRanges(session, kernelView, opts = {}) {
           end,
           count: segment.count,
           tokens: segment.tokens,
+          chars: segment.chars,
           toolPct: segment.count > 0 ? Math.round(segment.toolCount / segment.count * 100) : 0,
           images: segment.images,
           files: segment.files
@@ -7886,7 +7923,7 @@ var DEFAULT_PROMPTS = {
     header: "Surface: {surface}",
     title: "Compressible ranges ({count}, oldest first; exact surface seqs \u2014 usable as-is):",
     line: "  - seq {start}..{end} \u2014 {count} messages, ~{tokens} tokens [tool {toolPct}% | text {textPct}%]{media}",
-    footer: "Compress with: compress({ content: [{ startSeq, endSeq, summary }] }) \u2014 content is an array: batch multiple unrelated segments in one call, each entry its own block. Keep ranges disjoint.\nSnapshot taken at nudge time: the seqs go stale once the surface moves (a later compress shadows them), so re-run acp_status for fresh refs before compressing.\nBefore you compress any row above, confirm it is truly consumed \u2014 if a span still holds live task state (where you are in the task / open TODOs, paths already ruled out, artifacts already done and where they live), carry that state into your summary or keep the span live. Compressing an in-progress span without carrying its state forces a full re-run afterward."
+    footer: "The table selects the largest reclaimable ranges (oldest first within the set); leftovers below the tool's minimum are omitted.\nCompress with: compress({ content: [{ startSeq, endSeq, summary }] }) \u2014 content is an array: batch multiple unrelated segments in one call, each entry its own block. Keep ranges disjoint.\nSnapshot taken at nudge time: the seqs go stale once the surface moves (a later compress shadows them), so re-run acp_status for fresh refs before compressing.\nBefore you compress any row above, confirm it is truly consumed \u2014 if a span still holds live task state (where you are in the task / open TODOs, paths already ruled out, artifacts already done and where they live), carry that state into your summary or keep the span live. Compressing an in-progress span without carrying its state forces a full re-run afterward."
   },
   tools: {
     compress: 'Replace older conversation ranges with dense summaries you write. Each message seq is a surface reference. Single range: compress({ content: [{ startSeq, endSeq, summary }] }). Batch multiple unrelated ranges in one call (each content entry becomes its own block); keep ranges disjoint. Never compress content the current step is actively using. Compress boundaries are SURFACE SEQS (acp_status Surface: row, latest nudge table) \u2014 NOT the block refs (bN, e.g. b1) that acp_status COMPRESSED BLOCKS shows, which are for decompress only. Drilldown mN refs (e.g. m00306) are ALSO accepted as startSeq/endSeq \u2014 they are auto-mapped to the live surface seq; an unknown mN (never assigned on the current surface) fails with guidance. Seq refs must come from the CURRENT surface (acp_status or the latest nudge): a span whose edges were shadowed by an earlier compress is auto-remapped to its still-live content, a fully compressed span is reported as already compressed, and invented/other-session seqs fail with guidance. Good compression moments: stage or subtask completion whose details you have fully consumed and will not re-check, strategy switches, intermediate milestones, and wrapping up failed exploration \u2014 when the details are consumed and no longer critical for the task ahead. Before compressing, ask: will I need to re-verify any detail from this range in this task? If yes, keep it live. When you write a summary, turn dead-end exploration into a conclusion (what was tried, why it failed, the next step) \u2014 not a blow-by-blow; and keep the summary the ONLY record: self-contained, so a later reader (or you, after decompress) can continue without the original. Optional verifiedReadings: string[] per content entry records acceptance readings that are already green (e.g. "t0-fastpath 8/8") \u2014 stored structurally on the compaction event so later steps need not re-run them. TIER 2 COMPRESSION \u2014 DISTILLATION (compressing a block\'s summary node): the parent summary folds into your new summary and the originals are freed. For each source block: header line `Source: bN+bM+... (XK\u2192YK tok, Zx). [topic]`, then 3-5 self-contained bullets. Start each with the outcome, not the process. KEEP: decisions + their rationale, final outcomes (versions/PRs/bugs), critical constraints, module names/paths that LOCATE code. DROP: exact line numbers, diffs, verbose signatures, build/deploy/review process. Mark superseded content one line: `[SUPERSEDED by PR #NNN]` / `[OBSOLETE: deleted in vX.Y.Z]` and drop its details. Merge same-topic facts from different blocks \u2014 state each fact once. Size target: 50-150 tokens per source block. TIER 3 COMPRESSION \u2014 ULTRA-CONDENSATION (distilling a tier-2 block): 1-3 facts per source block, each a single line: subject + outcome in \u22648 words (format: "[PR/Issue/Version] \u2014 [outcome]"). No explanations, no rationale, no process. Merge related facts across blocks. Drop lessons unless the failure is likely to recur AND the block is <30 days old. Size target: 30-60 tokens per block including the header.',
@@ -7958,12 +7995,49 @@ function meterMediaPriceResolver(agent, session) {
     return prices.get(seq) ?? 0;
   };
 }
-function rangeTable(session, kernelView, prompts = DEFAULT_RESOLVED, mediaPriceOf) {
-  const ranges = buildCompressibleSeqRanges(
-    session,
-    kernelView,
-    mediaPriceOf === void 0 ? {} : { mediaPriceOf }
-  ).slice(0, 6);
+var RANGE_TABLE_LIMIT = 6;
+var RANGE_TABLE_HARD_LIMIT = 10;
+var lastTableBySession = /* @__PURE__ */ new WeakMap();
+function selectTableRanges(ranges, opts = {}) {
+  const limit = Math.max(1, opts.limit ?? RANGE_TABLE_LIMIT);
+  const minChars = opts.minChars ?? 0;
+  const usable = ranges.filter((range) => range.chars > 0 || range.images > 0 || range.files > 0);
+  if (usable.length === 0) return [];
+  const valueRanked = [...usable].sort((a, b) => b.tokens - a.tokens || a.start - b.start);
+  if (minChars > 0) {
+    const totalChars = valueRanked.reduce((sum, range) => sum + range.chars, 0);
+    if (totalChars < minChars) return [];
+  }
+  const picked = [];
+  let pickedChars = 0;
+  for (const range of valueRanked) {
+    picked.push(range);
+    pickedChars += range.chars;
+    const enough = minChars === 0 || pickedChars >= minChars;
+    if (picked.length >= limit && enough) break;
+    if (picked.length >= RANGE_TABLE_HARD_LIMIT) break;
+  }
+  if (minChars > 0 && pickedChars < minChars) return [];
+  return picked.sort((a, b) => a.start - b.start);
+}
+function activeBlockLine(session) {
+  const blocks = blockRegistry(session).filter((block) => block.active && block.summarySeq !== null);
+  if (blocks.length === 0) return "";
+  const shown = blocks.slice(0, 8).map((block) => `${block.kernelBlockId}(T${block.tier})`);
+  const more = blocks.length > shown.length ? ` +${blocks.length - shown.length} more` : "";
+  return `Active blocks (distill by passing block ids as startSeq/endSeq, e.g. compress({ content: [{ startSeq: "b3", endSeq: "b4", summary }] })): ${shown.join(" ")}${more}`;
+}
+function rangeTable(session, kernelView, prompts = DEFAULT_RESOLVED, mediaPriceOf, options = {}) {
+  const ranges = selectTableRanges(
+    buildCompressibleSeqRanges(session, kernelView, {
+      ...mediaPriceOf === void 0 ? {} : { mediaPriceOf },
+      ...options.minChars === void 0 ? {} : { minChars: options.minChars }
+    }),
+    options
+  );
+  return renderRangeTable(session, ranges, prompts);
+}
+function renderRangeTable(session, ranges, prompts = DEFAULT_RESOLVED) {
   if (ranges.length === 0) return "";
   const lines = ranges.map(
     (range) => renderTemplate(prompts.rangeTable.line, {
@@ -7976,13 +8050,15 @@ function rangeTable(session, kernelView, prompts = DEFAULT_RESOLVED, mediaPriceO
       media: mediaSuffixOf(range)
     })
   );
+  const blockLine = activeBlockLine(session);
   return [
     // 前导空串元素产生 nudge 中范围表前的唯一空行(§4:parts 层不再加分隔)。
     "",
     renderTemplate(prompts.rangeTable.header, { surface: surfaceSummary(session) }),
     renderTemplate(prompts.rangeTable.title, { count: ranges.length }),
     ...lines,
-    prompts.rangeTable.footer
+    prompts.rangeTable.footer,
+    ...blockLine === "" ? [] : [blockLine]
   ].join("\n");
 }
 function measuredTokenCount(agent, coreMessages) {
@@ -8012,7 +8088,7 @@ function computeSurfaceBreakdown(state, messages, total, growth) {
   return { system, tool, summaries, code, text, total, growth };
 }
 var EMERGENCY_NUDGE_MAX_PER_TURN = 3;
-function buildNudge(agent, env, lastNudgeTurn, emergencyNudges, onEmergencyCapHit) {
+function buildNudge(agent, env, lastNudgeTurn, emergencyNudges, onEmergencyCapHit, onNoEffectiveRanges, onRepeatedTable) {
   const session = agent.session;
   const state = env.store.stateFor(session);
   const coreMessages = allLogMessages(session);
@@ -8046,13 +8122,41 @@ function buildNudge(agent, env, lastNudgeTurn, emergencyNudges, onEmergencyCapHi
       emergencyNudges.set(session.id, { turn: turnNumber, count: 1 });
     }
   }
+  const kernelView = kernelRangeViewOf(nudge, turn.state);
+  const ranges = selectTableRanges(
+    buildCompressibleSeqRanges(session, kernelView, {
+      mediaPriceOf,
+      minChars: config.compress.minCompressRange
+    }),
+    { minChars: config.compress.minCompressRange }
+  );
+  const table = renderRangeTable(session, ranges, env.prompts);
+  const tierNudge = (nudge.tier === 2 || nudge.tier === 3) && (nudge.tierTargetBlocks?.length ?? 0) > 0;
+  if (table === "" && !tierNudge) {
+    onNoEffectiveRanges?.();
+    return null;
+  }
+  if (table !== "" && !emergency) {
+    const key = ranges.map((range) => `${range.start}..${range.end}:${range.tokens}:${range.chars}`).join("|");
+    const previous = lastTableBySession.get(session);
+    if (previous !== void 0 && previous.key === key) {
+      previous.repeats += 1;
+      if (previous.repeats >= 3) {
+        onRepeatedTable?.(previous.repeats);
+        return null;
+      }
+    } else {
+      lastTableBySession.set(session, { key, repeats: 0 });
+    }
+  }
   const text = buildNudgeText(
     nudge,
     emergency,
     session,
-    kernelRangeViewOf(nudge, turn.state),
+    kernelView,
     env.prompts,
-    mediaPriceOf
+    mediaPriceOf,
+    table
   );
   const message = createUserMessage2({
     content: [{ type: "text", text }],
@@ -8066,21 +8170,21 @@ function buildNudge(agent, env, lastNudgeTurn, emergencyNudges, onEmergencyCapHi
   });
   return { message, emergency };
 }
-function buildNudgeText(nudge, emergency, session, kernelView, prompts = DEFAULT_RESOLVED, mediaPriceOf) {
+function buildNudgeText(nudge, emergency, session, kernelView, prompts = DEFAULT_RESOLVED, mediaPriceOf, precomputedTable) {
   if (prompts.nudge !== DEFAULT_RESOLVED.nudge) {
-    return renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf);
+    return renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf, precomputedTable);
   }
   const rendered = renderNudgeText(nudge);
-  return adaptKernelNudgeToSeq(rendered.text, nudge, session, kernelView, prompts, mediaPriceOf);
+  return adaptKernelNudgeToSeq(rendered.text, nudge, session, kernelView, prompts, mediaPriceOf, precomputedTable);
 }
-function adaptKernelNudgeToSeq(text, nudge, session, kernelView, prompts, mediaPriceOf) {
+function adaptKernelNudgeToSeq(text, nudge, session, kernelView, prompts, mediaPriceOf, precomputedTable) {
   let out = stripNudgeGuidance(text);
   if ((nudge.tier === 2 || nudge.tier === 3) && (nudge.tierTargetBlocks?.length ?? 0) > 0) {
     out = replaceTierTrigger(out, nudge, session, prompts);
   } else if (out.includes('"startId"')) {
     out = replaceEmergencyExample(out);
   }
-  const seqTable = rangeTable(session, kernelView, prompts, mediaPriceOf);
+  const seqTable = precomputedTable === void 0 ? rangeTable(session, kernelView, prompts, mediaPriceOf) : precomputedTable;
   if (seqTable !== "") out = replaceRangesStr(out, seqTable);
   out = insertContentFormNote(out);
   return out;
@@ -8132,7 +8236,7 @@ function replaceEmergencyExample(text) {
   const end = next !== null ? start + 2 + next.index : text.length;
   return text.slice(0, start) + "\n\ncompress({ content: [{ startSeq, endSeq, summary }] }) \u2014 use the seqs from the range table above." + text.slice(end);
 }
-function renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf) {
+function renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf, precomputedTable) {
   const pct2 = Math.round(Math.min(nudge.contextUsage, 1) * 100);
   const frame = renderTemplate(
     emergency ? prompts.nudge.emergency : prompts.nudge.normal,
@@ -8173,7 +8277,7 @@ function renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts
     const tierRules = nudge.tier === 2 ? TIER2_DISTILL_RULES : TIER3_CONDENSE_RULES;
     parts.push("", tierRules);
   } else {
-    parts.push(rangeTable(session, kernelView, prompts, mediaPriceOf));
+    parts.push(precomputedTable === void 0 ? rangeTable(session, kernelView, prompts, mediaPriceOf) : precomputedTable);
   }
   if (prompts.nudge.tip !== "") parts.push("", CONTENT_FORM_NOTE, "", prompts.nudge.tip);
   return stripNudgeGuidance(parts.join("\n"));
@@ -8416,7 +8520,7 @@ function liveCarrierRejectionNote(start, end, carriers) {
   const last = carriers[carriers.length - 1];
   return `  seqs ${start}..${end} rejected \u2014 checkpoint ${list} carries the visible summary of a still-active block, and a plain seq range never supersedes one. Distill it with the block ids instead (compress({ content: [{ startSeq: "${first.kernelBlockId}", endSeq: "${last.kernelBlockId}", summary }] })), or cut the span around those seqs.`;
 }
-function protectedRowRejectionNote(start, end, hits, shadowed, session) {
+function protectedRowRejectionNote(start, end, hits, shadowed, session, minChars) {
   const preview = hits.slice(0, 4).join(", ");
   const more = hits.length > 4 ? ` +${hits.length - 4} more` : "";
   const first = shadowed.indexOf(hits[0]);
@@ -8424,7 +8528,18 @@ function protectedRowRejectionNote(start, end, hits, shadowed, session) {
   const before = first > 0 ? shadowed.slice(0, first) : [];
   const after = last >= 0 && last < shadowed.length - 1 ? shadowed.slice(last + 1) : [];
   const slices = [before, after].filter((slice) => slice.length > 0).map((slice) => `${slice[0]}..${slice[slice.length - 1]}`);
-  const recovery = slices.length === 0 ? "no part of this span is compressible while those rows are current \u2014 pick an OLDER span instead (acp_status lists the live ranges)" : `the compressible part of this span is seq ${slices.join(" and ")} \u2014 submit them as separate content entries (or two compress calls), each with its own summary`;
+  let recovery = slices.length === 0 ? "no part of this span is compressible while those rows are current \u2014 pick an OLDER span instead (acp_status lists the live ranges)" : `the compressible part of this span is seq ${slices.join(" and ")} \u2014 submit them as separate content entries (or two compress calls), each with its own summary`;
+  const leftovers = [...before, ...after];
+  if (session !== void 0 && minChars !== void 0 && minChars > 0 && leftovers.length > 0) {
+    let leftoverChars = 0;
+    for (const seq of leftovers) {
+      const event = eventAtOf(session, seq);
+      if (event !== void 0) leftoverChars += extractEventText(event).length;
+    }
+    if (leftoverChars > 0 && leftoverChars < minChars) {
+      recovery += ` \u2014 those leftovers total only ${leftoverChars} chars, below the ${minChars}-char minimum: splitting cannot pass the gate; target a larger range or distill an active block (bN..bM)`;
+    }
+  }
   let hasInstructions = false;
   let hasCatalog = false;
   let hasUserTurn = false;
@@ -8457,7 +8572,9 @@ function protectedRowRejectionNote(start, end, hits, shadowed, session) {
   const userOnly = hasUserTurn && !hasInstructions && !hasCatalog;
   const rowLabel = hasUserTurn ? "CURRENT guarded row(s)" : "CURRENT injected instruction row(s)";
   const staleCopyTail = userOnly ? "" : " (older/stale copies of the same channel are fine to compress)";
-  return `  seqs ${start}..${end} rejected \u2014 the span covers ${hits.length} ${rowLabel} (seq ${preview}${more}); ${reasons.join("; ")} \u2014 ${recovery}${staleCopyTail}`;
+  const outOfRange = hits.some((seq) => seq < start || seq > end);
+  const shadowedNote = outOfRange ? ` (positional shadow span: ${shadowed.slice(0, 12).join(", ")}${shadowed.length > 12 ? ` +${shadowed.length - 12} more` : ""})` : "";
+  return `  seqs ${start}..${end} rejected \u2014 the span covers ${hits.length} ${rowLabel} (seq ${preview}${more})${shadowedNote}; ${reasons.join("; ")} \u2014 ${recovery}${staleCopyTail}`;
 }
 function edgeRefForSeq(session, byRaw, seq, role, oppositeSeq) {
   const nodes = session.surface.nodes;
@@ -8540,7 +8657,14 @@ async function handleCompress(env, args, exec) {
     const shadowedSpan = shadowedSeqsOf(session, resolved.start, resolved.end);
     const instructionHits = guardedRowsInSpan(guardedSeqs, shadowedSpan);
     if (instructionHits.length > 0) {
-      rejectedNotes.push(protectedRowRejectionNote(resolved.start, resolved.end, instructionHits, shadowedSpan, session));
+      rejectedNotes.push(protectedRowRejectionNote(
+        resolved.start,
+        resolved.end,
+        instructionHits,
+        shadowedSpan,
+        session,
+        config.compress.minCompressRange
+      ));
       continue;
     }
     const startBlockRef = blockRefForSummarySeq(session, resolved.start);
@@ -9656,6 +9780,16 @@ var AcpCompactionEngine = class extends CompactionEngine {
         () => {
           ctx.logger.warn(
             `billion-context-dsh: emergency nudge suppressed \u2014 per-turn budget of ${EMERGENCY_NUDGE_MAX_PER_TURN} spent (session ${payload.agent.session.id}); pressure is still above the emergency threshold`
+          );
+        },
+        () => {
+          ctx.logger.info(
+            `billion-context-dsh: nudge suppressed \u2014 no effective range after host guards (session ${payload.agent.session.id})`
+          );
+        },
+        (repeats) => {
+          ctx.logger.warn(
+            `billion-context-dsh: nudge suppressed \u2014 identical range table offered ${repeats + 1} consecutive times (session ${payload.agent.session.id}); waiting for the surface to change`
           );
         }
       );

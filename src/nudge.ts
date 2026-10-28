@@ -24,6 +24,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { AcpStateStore } from './state.ts'
 import { allLogMessages, eventsToCoreMessages, isCheckpointNode, surfaceEventsOf } from './messages.ts'
 import {
+  blockRegistry,
   buildCompressibleSeqRanges,
   findOpenTurn,
   summarySeqOfKernelBlock,
@@ -148,6 +149,93 @@ export function meterMediaPriceResolver(
   }
 }
 
+/** How many rows the nudge table shows by default. */
+const RANGE_TABLE_LIMIT = 6
+/** Hard ceiling when extra rows are needed to clear the apply gate's minimum. */
+const RANGE_TABLE_HARD_LIMIT = 10
+
+/**
+ * Per-session memory of the last offered row set (see the backoff in
+ * `buildNudge`). A table whose ROWS did not change is not new instruction:
+ * live session 4b71d96c received the same six tiny rows for 21 consecutive
+ * nudges (~11K tokens) and the model concluded nothing else was compressible.
+ */
+const lastTableBySession = new WeakMap<object, { key: string; repeats: number }>()
+
+export interface RangeTableOptions {
+  /**
+   * The kernel's `compress.minCompressRange` (CHARS — acp-kernel#511). When
+   * set, the table only offers a set that can actually pass the apply gate:
+   * a head of tiny leftovers below the minimum is dropped instead of being
+   * re-offered forever, and the whole table is suppressed when even the full
+   * surface cannot reach the minimum.
+   */
+  readonly minChars?: number
+  /** Maximum rows (default 6). */
+  readonly limit?: number
+}
+
+/**
+ * Select the rows the nudge table offers.
+ *
+ * History (live session 4b71d96c, 2026-10-28): the table was built
+ * `oldest-first` and then `.slice(0, 6)`. After the early big ranges were
+ * compressed, six tiny leftovers (413/200/11/470/51/560 tokens, 4,590 chars
+ * total) occupied the six slots for 21 consecutive nudges. The collection
+ * itself failed every time (`4,590 < minCompressRange 5,000`), and a 49,931-
+ * char / 12,664-token tool result behind it was never shown. The model
+ * concluded "only those six are compressible" and stopped trying.
+ *
+ * Selection is therefore VALUE-ranked (largest reclaim first), and the picked
+ * set is only accepted when its total chars can clear the apply gate. The
+ * selected rows are then displayed oldest-first, so the model still walks the
+ * surface front-to-back — the stability rationale survives, only the
+ * starvation is gone.
+ */
+export function selectTableRanges(
+  ranges: readonly SeqCompressibleRange[],
+  opts: RangeTableOptions = {},
+): SeqCompressibleRange[] {
+  const limit = Math.max(1, opts.limit ?? RANGE_TABLE_LIMIT)
+  const minChars = opts.minChars ?? 0
+  // A span with no text and no media reclaims nothing; never offer it.
+  const usable = ranges.filter((range) => range.chars > 0 || range.images > 0 || range.files > 0)
+  if (usable.length === 0) return []
+  const valueRanked = [...usable].sort((a, b) => b.tokens - a.tokens || a.start - b.start)
+  if (minChars > 0) {
+    const totalChars = valueRanked.reduce((sum, range) => sum + range.chars, 0)
+    // Even the whole surface cannot satisfy the gate: any subset would be a
+    // guaranteed "Total compressible content too small" rejection.
+    if (totalChars < minChars) return []
+  }
+  const picked: SeqCompressibleRange[] = []
+  let pickedChars = 0
+  for (const range of valueRanked) {
+    picked.push(range)
+    pickedChars += range.chars
+    const enough = minChars === 0 || pickedChars >= minChars
+    if (picked.length >= limit && enough) break
+    if (picked.length >= RANGE_TABLE_HARD_LIMIT) break
+  }
+  if (minChars > 0 && pickedChars < minChars) return []
+  // Display oldest-first among the selected rows (selection stays value-ranked).
+  return picked.sort((a, b) => a.start - b.start)
+}
+
+/**
+ * One line naming the active compressible blocks. The tier-distillation path
+ * is the lever that actually worked in the live deadlock (b3..b6 reclaimed
+ * 8.7K tokens after the model hit a rejection), so the table points at it
+ * instead of forcing the model to discover it from an error message.
+ */
+function activeBlockLine(session: import('@deepseek-ai/dsh-session').Session): string {
+  const blocks = blockRegistry(session).filter((block) => block.active && block.summarySeq !== null)
+  if (blocks.length === 0) return ''
+  const shown = blocks.slice(0, 8).map((block) => `${block.kernelBlockId}(T${block.tier})`)
+  const more = blocks.length > shown.length ? ` +${blocks.length - shown.length} more` : ''
+  return `Active blocks (distill by passing block ids as startSeq/endSeq, e.g. compress({ content: [{ startSeq: "b3", endSeq: "b4", summary }] })): ${shown.join(' ')}${more}`
+}
+
 /**
  * Render the compressible-range table as seq refs for the model.
  *
@@ -162,12 +250,28 @@ export function rangeTable(
   kernelView: KernelRangeView,
   prompts: ResolvedPrompts = DEFAULT_RESOLVED,
   mediaPriceOf?: MediaPriceOf,
+  options: RangeTableOptions = {},
 ): string {
-  const ranges = buildCompressibleSeqRanges(
-    session,
-    kernelView,
-    mediaPriceOf === undefined ? {} : { mediaPriceOf },
-  ).slice(0, 6)
+  const ranges = selectTableRanges(
+    buildCompressibleSeqRanges(session, kernelView, {
+      ...(mediaPriceOf === undefined ? {} : { mediaPriceOf }),
+      ...(options.minChars === undefined ? {} : { minChars: options.minChars }),
+    }),
+    options,
+  )
+  return renderRangeTable(session, ranges, prompts)
+}
+
+/**
+ * Render already-selected rows as the nudge's seq table. Split from
+ * `rangeTable` so `buildNudge` can compute the selection once (it needs the
+ * row key for the repeated-table backoff) and hand the rendered text in.
+ */
+export function renderRangeTable(
+  session: import('@deepseek-ai/dsh-session').Session,
+  ranges: readonly SeqCompressibleRange[],
+  prompts: ResolvedPrompts = DEFAULT_RESOLVED,
+): string {
   // 零范围:整块省略(保留现状的提前返回与 nudge 尾部 '\n')。
   if (ranges.length === 0) return ''
   const lines = ranges.map((range) =>
@@ -181,6 +285,7 @@ export function rangeTable(
       media: mediaSuffixOf(range),
     }),
   )
+  const blockLine = activeBlockLine(session)
   return [
     // 前导空串元素产生 nudge 中范围表前的唯一空行(§4:parts 层不再加分隔)。
     '',
@@ -188,6 +293,7 @@ export function rangeTable(
     renderTemplate(prompts.rangeTable.title, { count: ranges.length }),
     ...lines,
     prompts.rangeTable.footer,
+    ...(blockLine === '' ? [] : [blockLine]),
   ].join('\n')
 }
 
@@ -284,6 +390,8 @@ export function buildNudge(
   lastNudgeTurn: Map<string, number>,
   emergencyNudges: Map<string, { turn: number; count: number }>,
   onEmergencyCapHit?: () => void,
+  onNoEffectiveRanges?: () => void,
+  onRepeatedTable?: (repeats: number) => void,
 ): NudgeOutcome | null {
   const session = agent.session
   const state = env.store.stateFor(session)
@@ -341,13 +449,57 @@ export function buildNudge(
     }
   }
 
+  // The nudge decision and the table it shows MUST use the same geometry. The
+  // kernel decided `shouldInject` from its own pre-barrier ranges; the host
+  // barriers (instruction rows, checkpoints, recent tail) can shrink that set
+  // below the apply gate's minimum. Live session 4b71d96c: the kernel kept
+  // firing because its pre-split range passed, while the post-split table was
+  // a 4,590-char six-piece set that every `compress` call rejected.
+  const kernelView = kernelRangeViewOf(nudge, turn.state)
+  const ranges = selectTableRanges(
+    buildCompressibleSeqRanges(session, kernelView, {
+      mediaPriceOf,
+      minChars: config.compress.minCompressRange,
+    }),
+    { minChars: config.compress.minCompressRange },
+  )
+  const table = renderRangeTable(session, ranges, env.prompts)
+  const tierNudge =
+    (nudge.tier === 2 || nudge.tier === 3) && (nudge.tierTargetBlocks?.length ?? 0) > 0
+  if (table === '' && !tierNudge) {
+    // No effective range (or the whole surface is below minCompressRange):
+    // a "compress now" nudge would be an instruction the model cannot obey.
+    onNoEffectiveRanges?.()
+    return null
+  }
+  if (table !== '' && !emergency) {
+    // Same-row-set backoff for NORMAL pressure only. Emergency nudges are the
+    // pressure alarm and already have their own per-turn cap; suppressing them
+    // would hide a full context. Normal nudges (once per turn) are the ones
+    // that produced 21 identical tables in live session 4b71d96c — three
+    // chances is enough there. The surface line changes every step, so key on
+    // the ROWS, not the rendered text.
+    const key = ranges.map((range) => `${range.start}..${range.end}:${range.tokens}:${range.chars}`).join('|')
+    const previous = lastTableBySession.get(session)
+    if (previous !== undefined && previous.key === key) {
+      previous.repeats += 1
+      if (previous.repeats >= 3) {
+        onRepeatedTable?.(previous.repeats)
+        return null
+      }
+    } else {
+      lastTableBySession.set(session, { key, repeats: 0 })
+    }
+  }
+
   const text = buildNudgeText(
     nudge,
     emergency,
     session,
-    kernelRangeViewOf(nudge, turn.state),
+    kernelView,
     env.prompts,
     mediaPriceOf,
+    table,
   )
   const message = createUserMessage({
     content: [{ type: 'text', text }],
@@ -382,15 +534,16 @@ export function buildNudgeText(
   kernelView: KernelRangeView,
   prompts: ResolvedPrompts = DEFAULT_RESOLVED,
   mediaPriceOf?: MediaPriceOf,
+  precomputedTable?: string,
 ): string {
   // A host override of any nudge slot → template rendering (config.prompts
   // keeps its v0.1.9 contract: custom copy wins). Only the pristine default
   // reference reaches the kernel path.
   if (prompts.nudge !== DEFAULT_RESOLVED.nudge) {
-    return renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf)
+    return renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf, precomputedTable)
   }
   const rendered = renderNudgeText(nudge)
-  return adaptKernelNudgeToSeq(rendered.text, nudge, session, kernelView, prompts, mediaPriceOf)
+  return adaptKernelNudgeToSeq(rendered.text, nudge, session, kernelView, prompts, mediaPriceOf, precomputedTable)
 }
 
 /**
@@ -414,6 +567,7 @@ function adaptKernelNudgeToSeq(
   kernelView: KernelRangeView,
   prompts: ResolvedPrompts,
   mediaPriceOf?: MediaPriceOf,
+  precomputedTable?: string,
 ): string {
   // B6：先摘掉哲学/规则段（它们住在系统提示与工具描述里），再做 seq 适配
   let out = stripNudgeGuidance(text)
@@ -429,7 +583,9 @@ function adaptKernelNudgeToSeq(
   // Replace the ref-ID range table (mNNNNN) with the surface-seq table.
   // A zero-range table leaves the kernel's own "[No specific ranges detected]"
   // notice intact — it is a better prompt than an empty table.
-  const seqTable = rangeTable(session, kernelView, prompts, mediaPriceOf)
+  const seqTable = precomputedTable === undefined
+    ? rangeTable(session, kernelView, prompts, mediaPriceOf)
+    : precomputedTable
   if (seqTable !== '') out = replaceRangesStr(out, seqTable)
   out = insertContentFormNote(out)
   return out
@@ -526,6 +682,7 @@ function renderNudgeFromTemplates(
   kernelView: KernelRangeView,
   prompts: ResolvedPrompts,
   mediaPriceOf?: MediaPriceOf,
+  precomputedTable?: string,
 ): string {
   // Cap the reported percentage at 100: a broken measurement (e.g. response
   // pressure folded in) must never surface as an absurd "230%" to the model.
@@ -580,7 +737,9 @@ function renderNudgeFromTemplates(
     parts.push('', tierRules)
   } else {
     // Range table for non-tier nudges (DSH-specific: seq-based, not ref-ID-based).
-    parts.push(rangeTable(session, kernelView, prompts, mediaPriceOf))
+    parts.push(precomputedTable === undefined
+      ? rangeTable(session, kernelView, prompts, mediaPriceOf)
+      : precomputedTable)
   }
 
   // Batch-compress tip (from kernel's nudge-text.ts style). The array-form

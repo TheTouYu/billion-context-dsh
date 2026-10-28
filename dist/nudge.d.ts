@@ -9,7 +9,7 @@ import { type CompressionCore, type CompressionState, type ContextBreakdown, typ
 import { type UserMessage } from '@deepseek-ai/dsh-llm';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { AcpStateStore } from './state.ts';
-import { type KernelRangeView, type MediaPriceOf } from './region.ts';
+import { type KernelRangeView, type MediaPriceOf, type SeqCompressibleRange } from './region.ts';
 import { type KernelConfigInput } from './config.ts';
 import { type ResolvedPrompts } from './prompts.ts';
 export declare function stripNudgeGuidance(text: string): string;
@@ -46,6 +46,36 @@ export declare function resolveTokenCount(agent: Agent, coreMessages: CoreMessag
  * same vocabulary as the nudge table.
  */
 export declare function meterMediaPriceResolver(agent: Agent, session: import('@deepseek-ai/dsh-session').Session): MediaPriceOf;
+export interface RangeTableOptions {
+    /**
+     * The kernel's `compress.minCompressRange` (CHARS — acp-kernel#511). When
+     * set, the table only offers a set that can actually pass the apply gate:
+     * a head of tiny leftovers below the minimum is dropped instead of being
+     * re-offered forever, and the whole table is suppressed when even the full
+     * surface cannot reach the minimum.
+     */
+    readonly minChars?: number;
+    /** Maximum rows (default 6). */
+    readonly limit?: number;
+}
+/**
+ * Select the rows the nudge table offers.
+ *
+ * History (live session 4b71d96c, 2026-10-28): the table was built
+ * `oldest-first` and then `.slice(0, 6)`. After the early big ranges were
+ * compressed, six tiny leftovers (413/200/11/470/51/560 tokens, 4,590 chars
+ * total) occupied the six slots for 21 consecutive nudges. The collection
+ * itself failed every time (`4,590 < minCompressRange 5,000`), and a 49,931-
+ * char / 12,664-token tool result behind it was never shown. The model
+ * concluded "only those six are compressible" and stopped trying.
+ *
+ * Selection is therefore VALUE-ranked (largest reclaim first), and the picked
+ * set is only accepted when its total chars can clear the apply gate. The
+ * selected rows are then displayed oldest-first, so the model still walks the
+ * surface front-to-back — the stability rationale survives, only the
+ * starvation is gone.
+ */
+export declare function selectTableRanges(ranges: readonly SeqCompressibleRange[], opts?: RangeTableOptions): SeqCompressibleRange[];
 /**
  * Render the compressible-range table as seq refs for the model.
  *
@@ -55,7 +85,13 @@ export declare function meterMediaPriceResolver(agent: Agent, session: import('@
  * `UPSTREAM:` workaround for kernel ref-map drift; that drift is fixed upstream
  * (acp-kernel #207) and the workaround is gone (rule 11).
  */
-export declare function rangeTable(session: import('@deepseek-ai/dsh-session').Session, kernelView: KernelRangeView, prompts?: ResolvedPrompts, mediaPriceOf?: MediaPriceOf): string;
+export declare function rangeTable(session: import('@deepseek-ai/dsh-session').Session, kernelView: KernelRangeView, prompts?: ResolvedPrompts, mediaPriceOf?: MediaPriceOf, options?: RangeTableOptions): string;
+/**
+ * Render already-selected rows as the nudge's seq table. Split from
+ * `rangeTable` so `buildNudge` can compute the selection once (it needs the
+ * row key for the repeated-table backoff) and hand the rendered text in.
+ */
+export declare function renderRangeTable(session: import('@deepseek-ai/dsh-session').Session, ranges: readonly SeqCompressibleRange[], prompts?: ResolvedPrompts): string;
 /**
  * Compute a SURFACE-ONLY context breakdown for display, aligned with
  * `acp_status` (kernel `buildStatusReport`/`renderOverview`).
@@ -106,7 +142,7 @@ export declare const EMERGENCY_NUDGE_MAX_PER_TURN = 3;
 export declare function buildNudge(agent: Agent, env: NudgeEnvironment, lastNudgeTurn: Map<string, number>, emergencyNudges: Map<string, {
     turn: number;
     count: number;
-}>, onEmergencyCapHit?: () => void): NudgeOutcome | null;
+}>, onEmergencyCapHit?: () => void, onNoEffectiveRanges?: () => void, onRepeatedTable?: (repeats: number) => void): NudgeOutcome | null;
 /**
  * Render the nudge message text. DEFAULT (no `config.prompts.nudge` override)
  * calls the kernel's own `renderNudgeText` — EFFICIENCY_NOTE/EMERGENCY_HEADER,
@@ -120,4 +156,4 @@ export declare function buildNudge(agent: Agent, env: NudgeEnvironment, lastNudg
  * When a host overrides any `prompts.nudge` slot, the template path is used so
  * `config.prompts` keeps full control (custom copy wins over kernel defaults).
  */
-export declare function buildNudgeText(nudge: NudgeDecision, emergency: boolean, session: import('@deepseek-ai/dsh-session').Session, kernelView: KernelRangeView, prompts?: ResolvedPrompts, mediaPriceOf?: MediaPriceOf): string;
+export declare function buildNudgeText(nudge: NudgeDecision, emergency: boolean, session: import('@deepseek-ai/dsh-session').Session, kernelView: KernelRangeView, prompts?: ResolvedPrompts, mediaPriceOf?: MediaPriceOf, precomputedTable?: string): string;

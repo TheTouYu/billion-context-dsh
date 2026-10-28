@@ -210,6 +210,14 @@ export interface SeqCompressibleRange {
     readonly end: number;
     readonly count: number;
     readonly tokens: number;
+    /**
+     * Raw text characters in the span. The kernel's `minCompressRange` gate is
+     * measured in CHARS (acp-kernel#511: `totalRangeChars += msg.text.length`),
+     * so the host must price the same unit when it decides whether an offered
+     * table can pass the apply gate. Token counts alone cannot answer that
+     * (CJK ≈ 1 char/token, Latin ≈ 4 chars/token).
+     */
+    readonly chars: number;
     /** Share of messages that are tool messages (tool-call or tool-result), 0-100 — kernel `toolPct` parity. */
     readonly toolPct: number;
     /** Image blocks reachable inside the span (directly or through a tool result). */
@@ -389,6 +397,7 @@ export interface KernelRangeView {
 export declare function buildCompressibleSeqRanges(session: Session, kernelView: KernelRangeView, opts?: {
     preserveRecent?: number;
     mediaPriceOf?: MediaPriceOf;
+    minChars?: number;
 }): SeqCompressibleRange[];
 /**
  * A compact human-readable description of the current surface for the model:

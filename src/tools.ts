@@ -418,6 +418,7 @@ export function protectedRowRejectionNote(
   hits: readonly number[],
   shadowed: readonly number[],
   session?: Session,
+  minChars?: number,
 ): string {
   const preview = hits.slice(0, 4).join(', ')
   const more = hits.length > 4 ? ` +${hits.length - 4} more` : ''
@@ -428,9 +429,24 @@ export function protectedRowRejectionNote(
   const slices = [before, after]
     .filter((slice) => slice.length > 0)
     .map((slice) => `${slice[0]}..${slice[slice.length - 1]}`)
-  const recovery = slices.length === 0
+  let recovery = slices.length === 0
     ? 'no part of this span is compressible while those rows are current — pick an OLDER span instead (acp_status lists the live ranges)'
     : `the compressible part of this span is seq ${slices.join(' and ')} — submit them as separate content entries (or two compress calls), each with its own summary`
+  // Do not send the model to a split that the apply gate will reject. Live
+  // session 4b71d96c: the guard left six slices totalling 4,590 chars, the tool
+  // told the model to split, and the next call failed `4,590 < min 5,000`. The
+  // note now prices the leftovers in the gate's own unit (chars).
+  const leftovers = [...before, ...after]
+  if (session !== undefined && minChars !== undefined && minChars > 0 && leftovers.length > 0) {
+    let leftoverChars = 0
+    for (const seq of leftovers) {
+      const event = eventAtOf(session, seq)
+      if (event !== undefined) leftoverChars += extractEventText(event).length
+    }
+    if (leftoverChars > 0 && leftoverChars < minChars) {
+      recovery += ` — those leftovers total only ${leftoverChars} chars, below the ${minChars}-char minimum: splitting cannot pass the gate; target a larger range or distill an active block (bN..bM)`
+    }
+  }
   // Why the guarded rows may not be folded, per channel. Without a session the
   // hits cannot be classified, so the wording stays the instruction-only text
   // this note has always carried (pinned by tests).
@@ -477,7 +493,15 @@ export function protectedRowRejectionNote(
   const userOnly = hasUserTurn && !hasInstructions && !hasCatalog
   const rowLabel = hasUserTurn ? 'CURRENT guarded row(s)' : 'CURRENT injected instruction row(s)'
   const staleCopyTail = userOnly ? '' : ' (older/stale copies of the same channel are fine to compress)'
-  return `  seqs ${start}..${end} rejected — the span covers ${hits.length} ${rowLabel} (seq ${preview}${more}); ${reasons.join('; ')} — ${recovery}${staleCopyTail}`
+  // When the guarded row is numerically OUTSIDE the requested edges, the
+  // surface has placed it inside the positional span (checkpoint nodes land
+  // mid-array after a replacement). Naming the actual shadowed slice avoids
+  // the "seqs 87..91 ... (seq 46)" contradiction the live session hit.
+  const outOfRange = hits.some((seq) => seq < start || seq > end)
+  const shadowedNote = outOfRange
+    ? ` (positional shadow span: ${shadowed.slice(0, 12).join(', ')}${shadowed.length > 12 ? ` +${shadowed.length - 12} more` : ''})`
+    : ''
+  return `  seqs ${start}..${end} rejected — the span covers ${hits.length} ${rowLabel} (seq ${preview}${more})${shadowedNote}; ${reasons.join('; ')} — ${recovery}${staleCopyTail}`
 }
 
 /**
@@ -673,7 +697,14 @@ async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: To
     const shadowedSpan = shadowedSeqsOf(session, resolved.start, resolved.end)
     const instructionHits = guardedRowsInSpan(guardedSeqs, shadowedSpan)
     if (instructionHits.length > 0) {
-      rejectedNotes.push(protectedRowRejectionNote(resolved.start, resolved.end, instructionHits, shadowedSpan, session))
+      rejectedNotes.push(protectedRowRejectionNote(
+        resolved.start,
+        resolved.end,
+        instructionHits,
+        shadowedSpan,
+        session,
+        config.compress.minCompressRange,
+      ))
       continue
     }
     // An edge on an ACTIVE block's checkpoint summary node resolves to the

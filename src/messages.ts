@@ -575,6 +575,19 @@ const REAL_CONTENT_PLUGINS: ReadonlySet<string> = new Set([
   '@deepseek-ai/dsh-system-prompt',
   'user-approval',
   'tools-ptc',
+  // 2026-10-28 live audit (genshin-ts session 4b71d96c): these channels are
+  // CONTENT, not policy. They used to fall to 'instruction' only because they
+  // were not listed, which made 250 rows / 199K tokens un-compressible and
+  // split every compressible span. None of them has a presence gate that
+  // re-injects a folded row; the injector is driven by query/cadence, not by
+  // "the previous block disappeared". The newest copy of each stays inside
+  // the recent-tail guard, so folding an older copy cannot remove live recall.
+  'memo-river', // passive recall + write-cadence blocks
+  'agent-message', // teammate message relayed into the user stream
+  'time-context', // clock snapshot (a new row every turn)
+  'skill-rec', // skill recommendation nudge
+  'preset-composer', // capability overview injected once
+  'repeat-tool-reminder', // advisory emitted when the model repeats a tool call
 ])
 
 /**
@@ -590,6 +603,16 @@ const REAL_CONTENT_PLUGINS: ReadonlySet<string> = new Set([
 const REAL_CONTENT_KINDS: ReadonlySet<string> = new Set([
   'runtime-context', // dynamic-context snapshot (was '@deepseek-ai/dsh-system-prompt')
   'ptc-mode', // deferred tool context (was 'tools-ptc' / 'tools-code-mode')
+  // Direct-kind spellings of the audited content channels above. `isRealUserTurn`
+  // subtracts this set from the "last real user" scan, so a foldable injection
+  // can never win the active-user-turn protection window.
+  'memo-river',
+  'agent-message',
+  'time-context',
+  'skill-rec',
+  'preset-composer',
+  'repeat-tool-reminder',
+  'user-approval', // one-shot approval notice (direct-kind migration of the plugin row)
 ])
 
 /** Audited relay kinds: not the user speaking, but genuine conversation content. */

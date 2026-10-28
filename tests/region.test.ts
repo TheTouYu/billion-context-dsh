@@ -607,6 +607,33 @@ test('M5: buildCompressibleSeqRanges carries kernel-parity toolPct and oldest-fi
   }
 })
 
+test('M5: buildCompressibleSeqRanges drops a kernel range whose guarded pieces are below minChars', () => {
+  // Live shape (session 4b71d96c): one kernel range was split by host barriers
+  // into six pieces totalling 4,590 chars, below the 5,000-char apply gate.
+  // The per-kernel-range check must drop that whole range, while the larger
+  // range behind it survives.
+  const session = Session.create('minchars')
+  appendTurn(session, 1)
+  appendUser(session, longText('q0', 0))                  // seq 1 — 2-message text range
+  appendAssistant(session, longText('a0', 1), 1, 1)       // seq 2
+  appendUser(session, longText('q1', 2))                  // seq 3 — last user → protected → split
+  appendAssistant(session, longText('a1', 3), 1, 2)       // seq 4 — 3-message tool range
+  appendToolCall(session, longText('call', 4), 'call_1', 1, 3)    // seq 5
+  appendToolResult(session, longText('result', 5), 'call_1', 1, 4) // seq 6
+  const view = {
+    ranges: [{ startRef: 'm1', endRef: 'm2' }, { startRef: 'm3', endRef: 'm4' }],
+    refs: { byRef: { m1: '1', m2: '2', m3: '4', m4: '6' } },
+  }
+  const all = buildCompressibleSeqRanges(session, view, { preserveRecent: 0 })
+  assert.equal(all.length, 2, 'two kernel ranges yield two host ranges')
+  const textRange = all.find((range) => range.start === 1)!
+  const toolRange = all.find((range) => range.start === 4)!
+  assert.ok(textRange.chars > 0 && toolRange.chars > textRange.chars, 'fixture: the tool range is larger')
+  const minChars = textRange.chars + 1
+  const filtered = buildCompressibleSeqRanges(session, view, { preserveRecent: 0, minChars })
+  assert.deepEqual(filtered.map((range) => range.start), [4], 'only the range that can clear the gate survives')
+})
+
 test('M5: stripOrphanedSurfaceToolMessages preserves an in-flight tool call', () => {
   const session = Session.create('in-flight')
   appendTurn(session, 1)

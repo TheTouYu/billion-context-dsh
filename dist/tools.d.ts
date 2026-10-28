@@ -156,7 +156,7 @@ export declare function liveCarrierRejectionNote(start: number, end: number, car
     seq: number;
     kernelBlockId: string;
 }[]): string;
-export declare function protectedRowRejectionNote(start: number, end: number, hits: readonly number[], shadowed: readonly number[], session?: Session): string;
+export declare function protectedRowRejectionNote(start: number, end: number, hits: readonly number[], shadowed: readonly number[], session?: Session, minChars?: number): string;
 /**
  * Kernel ref for one RESOLVED range edge's surface node (issue #155).
  * Resolved edges are tool-pairing-balanced and anchorable, but NO LONGER

@@ -737,6 +737,19 @@ export class AcpCompactionEngine extends CompactionEngine {
             `billion-context-dsh: emergency nudge suppressed — per-turn budget of ${EMERGENCY_NUDGE_MAX_PER_TURN} spent (session ${payload.agent.session.id}); pressure is still above the emergency threshold`,
           )
         },
+        () => {
+          // The kernel's pre-barrier ranges passed the benefit floor, but the
+          // host-guarded table has no range that can clear minCompressRange.
+          // A "compress now" nudge here is an instruction the model cannot obey.
+          ctx.logger.info(
+            `billion-context-dsh: nudge suppressed — no effective range after host guards (session ${payload.agent.session.id})`,
+          )
+        },
+        (repeats) => {
+          ctx.logger.warn(
+            `billion-context-dsh: nudge suppressed — identical range table offered ${repeats + 1} consecutive times (session ${payload.agent.session.id}); waiting for the surface to change`,
+          )
+        },
       )
       if (outcome === null) return decision
       return { kind: 'enter', messages: [...decision.messages, outcome.message] }

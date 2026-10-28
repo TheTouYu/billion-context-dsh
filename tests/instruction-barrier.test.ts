@@ -103,6 +103,23 @@ test('PR1: classifySurfaceEvent buckets host policy rows; real content stays rea
   assert.equal(evOther('assistant/message'), 'real')
   assert.equal(ev({ kind: 'subagent-report' }), 'real', 'sub-agent relay is real content')
 
+  // Audited CONTENT channels (2026-10-28 live audit, session 4b71d96c): these
+  // are user-role rows but not policy. They must be foldable (not barriers)
+  // and must never win the "last real user" protection window.
+  for (const kind of ['memo-river', 'agent-message', 'time-context', 'skill-rec', 'preset-composer', 'repeat-tool-reminder']) {
+    assert.equal(ev({ kind }), 'real', `${kind} is content, not a policy barrier`)
+    assert.equal(
+      isRealUserTurn({ type: 'user/message', seq: 1, data: { source: { kind } } } as never),
+      false,
+      `${kind} never wins last-user protection`,
+    )
+  }
+  assert.equal(ev({ kind: 'plugin', plugin: 'memo-river' }), 'real', 'legacy plugin shape of a content channel folds too')
+  assert.equal(ev({ kind: 'user-approval' }), 'real', 'direct-kind approval notice folds (plugin shape already did)')
+  // Not in the audit: a skill BODY stays instruction for now (folding it
+  // mid-task would remove the constraints the model is following).
+  assert.equal(ev({ kind: 'skill-invocation' }), 'instruction')
+
   // The engine's own metadata rows stay metadata (foldable, like main).
   assert.equal(ev({ kind: 'plugin', plugin: 'acp-nudge' }), 'metadata')
   assert.equal(ev({ kind: 'plugin', plugin: 'billion-context-dsh' }), 'metadata')

@@ -204,7 +204,8 @@ export const DEFAULT_PROMPTS: ResolvedPrompts = {
     header: 'Surface: {surface}',
     title: 'Compressible ranges ({count}, oldest first; exact surface seqs — usable as-is):',
     line: '  - seq {start}..{end} — {count} messages, ~{tokens} tokens [tool {toolPct}% | text {textPct}%]{media}',
-    footer: 'Compress with: compress({ content: [{ startSeq, endSeq, summary }] }) — content is an array: batch multiple unrelated segments in one call, each entry its own block. Keep ranges disjoint.\n'
+    footer: 'The table selects the largest reclaimable ranges (oldest first within the set); leftovers below the tool\'s minimum are omitted.\n'
+      + 'Compress with: compress({ content: [{ startSeq, endSeq, summary }] }) — content is an array: batch multiple unrelated segments in one call, each entry its own block. Keep ranges disjoint.\n'
       + 'Snapshot taken at nudge time: the seqs go stale once the surface moves (a later compress shadows them), so re-run acp_status for fresh refs before compressing.\n'
       + 'Before you compress any row above, confirm it is truly consumed — if a span still holds live task state (where you are in the task / open TODOs, paths already ruled out, artifacts already done and where they live), carry that state into your summary or keep the span live. Compressing an in-progress span without carrying its state forces a full re-run afterward.',
   },

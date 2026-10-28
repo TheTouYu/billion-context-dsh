@@ -5,7 +5,8 @@ import { createCore, defaultCountTokens, type CompressionCore, type NudgeDecisio
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { AcpStateStore } from '../src/state.ts'
-import { buildNudge, buildNudgeText, computeSurfaceBreakdown, rangeTable, resolveTokenCount, EMERGENCY_NUDGE_MAX_PER_TURN } from '../src/nudge.ts'
+import { buildNudge, buildNudgeText, computeSurfaceBreakdown, rangeTable, resolveTokenCount, selectTableRanges, EMERGENCY_NUDGE_MAX_PER_TURN } from '../src/nudge.ts'
+import type { SeqCompressibleRange } from '../src/region.ts'
 import { makeTools, type ToolEnvironment } from '../src/tools.ts'
 import { rebuildBlockLedger, runCompactionTransaction } from '../src/region.ts'
 import { allLogMessages, eventsToCoreMessages, surfaceEventsOf } from '../src/messages.ts'
@@ -379,4 +380,37 @@ test('M4: nudge contextBreakdown is wired to the surface (kernel path uses compu
   // No blocks → summaries is zero; text carries the alternating user/assistant plain text.
   assert.equal(bd.summaries, 0)
   assert.ok(bd.text > 0)
+})
+
+function syntheticRange(start: number, tokens: number, chars: number): SeqCompressibleRange {
+  return { start, end: start, count: 1, tokens, chars, toolPct: 100, images: 0, files: 0 }
+}
+
+test('range selection: value-ranked rows are not starved by tiny leftovers (4b71d96c)', () => {
+  // The live failure shape: six tiny leftovers (4,590 chars total, below the
+  // 5,000-char gate) at the head, and a 49,931-char tool result behind them.
+  const tiny = [21, 22, 23, 24, 25, 26].map((seq, index) => syntheticRange(seq, 10 + index, 40))
+  const big = syntheticRange(300, 12664, 49931)
+  const picked = selectTableRanges([...tiny, big], { minChars: 5000, limit: 6 })
+  assert.ok(picked.some((range) => range.tokens === 12664), 'the big range is offered')
+  const chars = picked.reduce((sum, range) => sum + range.chars, 0)
+  assert.ok(chars >= 5000, `picked rows can pass the gate (${chars} chars)`)
+  // Displayed oldest-first (selection stays value-ranked).
+  const starts = picked.map((range) => range.start)
+  assert.deepEqual(starts, [...starts].sort((a, b) => a - b))
+})
+
+test('range selection: no table when even the whole surface cannot clear minChars', () => {
+  const small = [syntheticRange(1, 10, 40), syntheticRange(2, 10, 40)]
+  assert.deepEqual(selectTableRanges(small, { minChars: 5000 }), [])
+  // Without a minimum (tests / acp_status diagnostics) the same rows are offered.
+  assert.equal(selectTableRanges(small, {}).length, 2)
+})
+
+test('range selection: hard ceiling still lets the picked set reach the minimum', () => {
+  const rows = Array.from({ length: 12 }, (_, index) => syntheticRange(100 + index, 100, 1200))
+  const picked = selectTableRanges(rows, { minChars: 5000, limit: 4 })
+  // Four rows would only reach 4,800; the hard ceiling extends to five.
+  assert.equal(picked.length, 5)
+  assert.ok(picked.reduce((sum, range) => sum + range.chars, 0) >= 5000)
 })

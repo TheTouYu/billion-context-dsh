@@ -193,6 +193,7 @@ test('M4/prompts 4: range table snapshot (with ranges) and zero-range early retu
     `\nSurface: 12 nodes, seqs 1..12
 Compressible ranges (1, oldest first; exact surface seqs — usable as-is):
   - seq 1..7 — 7 messages, ~7227 tokens [tool 0% | text 100%]
+The table selects the largest reclaimable ranges (oldest first within the set); leftovers below the tool's minimum are omitted.
 Compress with: compress({ content: [{ startSeq, endSeq, summary }] }) — content is an array: batch multiple unrelated segments in one call, each entry its own block. Keep ranges disjoint.
 Snapshot taken at nudge time: the seqs go stale once the surface moves (a later compress shadows them), so re-run acp_status for fresh refs before compressing.
 Before you compress any row above, confirm it is truly consumed — if a span still holds live task state (where you are in the task / open TODOs, paths already ruled out, artifacts already done and where they live), carry that state into your summary or keep the span live. Compressing an in-progress span without carrying its state forces a full re-run afterward.`,
