@@ -6738,8 +6738,10 @@ var REAL_CONTENT_PLUGINS = /* @__PURE__ */ new Set([
   // skill recommendation nudge
   "preset-composer",
   // capability overview injected once
-  "repeat-tool-reminder"
+  "repeat-tool-reminder",
   // advisory emitted when the model repeats a tool call
+  "tool-jobs"
+  // background job lifecycle notice (dsh job system)
 ]);
 var REAL_CONTENT_KINDS = /* @__PURE__ */ new Set([
   "runtime-context",
@@ -6755,6 +6757,11 @@ var REAL_CONTENT_KINDS = /* @__PURE__ */ new Set([
   "skill-rec",
   "preset-composer",
   "repeat-tool-reminder",
+  // Background job lifecycle notices (dsh job system): engine bookkeeping, no
+  // presence gate, foldable like main. As an unknown kind it was BOTH an
+  // instruction barrier here AND a "fresh user input" trigger for memo-river
+  // (live audit 2026-10-29: 9 rows, 8 mid-turn, 6 caused recall injections).
+  "tool-jobs",
   "user-approval"
   // one-shot approval notice (direct-kind migration of the plugin row)
 ]);
@@ -7997,7 +8004,8 @@ function meterMediaPriceResolver(agent, session) {
 }
 var RANGE_TABLE_LIMIT = 6;
 var RANGE_TABLE_HARD_LIMIT = 10;
-var lastTableBySession = /* @__PURE__ */ new WeakMap();
+var lastTableBySession = /* @__PURE__ */ new Map();
+var LAST_TABLE_MAP_CAP = 256;
 function selectTableRanges(ranges, opts = {}) {
   const limit = Math.max(1, opts.limit ?? RANGE_TABLE_LIMIT);
   const minChars = opts.minChars ?? 0;
@@ -8136,9 +8144,9 @@ function buildNudge(agent, env, lastNudgeTurn, emergencyNudges, onEmergencyCapHi
     onNoEffectiveRanges?.();
     return null;
   }
-  if (table !== "" && !emergency) {
+  if (table !== "") {
     const key = ranges.map((range) => `${range.start}..${range.end}:${range.tokens}:${range.chars}`).join("|");
-    const previous = lastTableBySession.get(session);
+    const previous = lastTableBySession.get(session.id);
     if (previous !== void 0 && previous.key === key) {
       previous.repeats += 1;
       if (previous.repeats >= 3) {
@@ -8146,7 +8154,11 @@ function buildNudge(agent, env, lastNudgeTurn, emergencyNudges, onEmergencyCapHi
         return null;
       }
     } else {
-      lastTableBySession.set(session, { key, repeats: 0 });
+      if (lastTableBySession.size >= LAST_TABLE_MAP_CAP) {
+        const oldest = lastTableBySession.keys().next().value;
+        if (oldest !== void 0) lastTableBySession.delete(oldest);
+      }
+      lastTableBySession.set(session.id, { key, repeats: 0 });
     }
   }
   const text = buildNudgeText(

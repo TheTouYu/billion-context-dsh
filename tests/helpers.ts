@@ -107,9 +107,16 @@ export function appendEmptyToolResult(session: Session, callId: string, turn = 1
   }, { surfaceOp: 'append' })
 }
 
+/**
+ * Unique fixture-session counter: `buildNudge`'s identical-table backoff is
+ * keyed by session ID at module scope, so two fixtures sharing an id would
+ * leak repeat counts across tests (the emergency-cap tests share rows).
+ */
+let fixtureSessionSeq = 0
+
 /** A session with `count` alternating user/assistant text messages inside one open turn. */
-export function buildTextSession(count: number, id: string = 'test-session'): Session {
-  const session = Session.create(id)
+export function buildTextSession(count: number, id?: string): Session {
+  const session = Session.create(id ?? `test-session-${(fixtureSessionSeq += 1)}`)
   appendTurn(session, 1)
   for (let index = 0; index < count; index += 1) {
     if (index % 2 === 0) appendUser(session, longText('msg', index))

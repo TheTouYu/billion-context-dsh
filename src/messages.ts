@@ -588,6 +588,7 @@ const REAL_CONTENT_PLUGINS: ReadonlySet<string> = new Set([
   'skill-rec', // skill recommendation nudge
   'preset-composer', // capability overview injected once
   'repeat-tool-reminder', // advisory emitted when the model repeats a tool call
+  'tool-jobs', // background job lifecycle notice (dsh job system)
 ])
 
 /**
@@ -612,6 +613,11 @@ const REAL_CONTENT_KINDS: ReadonlySet<string> = new Set([
   'skill-rec',
   'preset-composer',
   'repeat-tool-reminder',
+  // Background job lifecycle notices (dsh job system): engine bookkeeping, no
+  // presence gate, foldable like main. As an unknown kind it was BOTH an
+  // instruction barrier here AND a "fresh user input" trigger for memo-river
+  // (live audit 2026-10-29: 9 rows, 8 mid-turn, 6 caused recall injections).
+  'tool-jobs',
   'user-approval', // one-shot approval notice (direct-kind migration of the plugin row)
 ])
 

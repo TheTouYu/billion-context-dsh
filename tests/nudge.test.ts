@@ -130,10 +130,28 @@ test('M4: the emergency nudge cap resets on a new user turn (issue #108)', () =>
   }
   assert.equal(buildNudge(agent, env, lastNudgeTurn, emergencyNudges), null, 'turn 1: call 4 is capped')
 
+  // New turn, IDENTICAL table: the budget resets, but the identical-row-set
+  // backoff holds (live aa2b7c00 got 9 identical emergency tables across as
+  // many turns — the alarm repeats taught nothing new). The suppression
+  // reason must be the repeated table, not the spent budget.
   appendTurn(session, 2)
+  let repeated = 0
+  assert.equal(
+    buildNudge(agent, env, lastNudgeTurn, emergencyNudges, undefined, undefined, (n) => { repeated = n }) === null,
+    true,
+    'turn 2: an identical table is not re-offered',
+  )
+  assert.ok(repeated >= 3, `the repeated-table hook fired (repeats=${repeated})`)
+
+  // Turn 3 with a CHANGED surface (two more messages extend the compressible
+  // span past the protected tail): the row set changes and the nudge lands
+  // again — the backoff tracks rows, not pressure.
+  appendTurn(session, 3)
+  appendUser(session, longText('turn3-a', 200))
+  appendUser(session, longText('turn3-b', 201))
   const fresh = buildNudge(agent, env, lastNudgeTurn, emergencyNudges)
-  assert.ok(fresh !== null, 'turn 2: the cap resets and an emergency nudge lands again')
-  assert.equal(fresh.emergency, true, 'turn 2: still an emergency nudge')
+  assert.ok(fresh !== null, 'turn 3: a changed row set re-enables the nudge')
+  assert.equal(fresh.emergency, true, 'turn 3: still an emergency nudge')
 })
 
 test('M4: a normal nudge does not consume the emergency budget (issue #108)', () => {

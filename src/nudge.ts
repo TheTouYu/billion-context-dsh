@@ -160,7 +160,21 @@ const RANGE_TABLE_HARD_LIMIT = 10
  * live session 4b71d96c received the same six tiny rows for 21 consecutive
  * nudges (~11K tokens) and the model concluded nothing else was compressible.
  */
-const lastTableBySession = new WeakMap<object, { key: string; repeats: number }>()
+/**
+ * Per-session memory of the last offered row set (see the backoff in
+ * `buildNudge`). A table whose ROWS did not change is not new instruction:
+ * live session 4b71d96c received the same six tiny rows for 21 consecutive
+ * nudges (~11K tokens) and the model concluded nothing else was compressible.
+ *
+ * Keyed by session ID, NOT the session object: the host may hand each turn a
+ * re-loaded session instance, and a WeakMap keyed by object identity silently
+ * reset the counter every turn (live: aa2b7c00 re-offered an identical table
+ * 5 times at normal pressure and 9 times at emergency pressure after the
+ * 2026-10-28 deploy). Bounded so a long-lived host does not accumulate one
+ * entry per historical session.
+ */
+const lastTableBySession = new Map<string, { key: string; repeats: number }>()
+const LAST_TABLE_MAP_CAP = 256
 
 export interface RangeTableOptions {
   /**
@@ -472,15 +486,19 @@ export function buildNudge(
     onNoEffectiveRanges?.()
     return null
   }
-  if (table !== '' && !emergency) {
-    // Same-row-set backoff for NORMAL pressure only. Emergency nudges are the
-    // pressure alarm and already have their own per-turn cap; suppressing them
-    // would hide a full context. Normal nudges (once per turn) are the ones
-    // that produced 21 identical tables in live session 4b71d96c — three
-    // chances is enough there. The surface line changes every step, so key on
-    // the ROWS, not the rendered text.
+  if (table !== '') {
+    // Same-row-set backoff, normal AND emergency pressure. The surface line
+    // changes every step, so key on the ROWS, not the rendered text. Three
+    // identical offers carry the whole instruction; beyond that an identical
+    // table is pure noise — live session 4b71d96c got 21 identical normal
+    // tables, and aa2b7c00 got 9 identical EMERGENCY tables (2026-10-28):
+    // repeating an instruction the model has seen three times does not raise
+    // pressure any better, it just trains the model to ignore nudges
+    // (issue #108's runaway shape, at turn granularity). Pressure visibility
+    // is preserved by the per-turn emergency budget and the overflow-recovery
+    // backstop; a CHANGED row set re-enables the nudge immediately.
     const key = ranges.map((range) => `${range.start}..${range.end}:${range.tokens}:${range.chars}`).join('|')
-    const previous = lastTableBySession.get(session)
+    const previous = lastTableBySession.get(session.id)
     if (previous !== undefined && previous.key === key) {
       previous.repeats += 1
       if (previous.repeats >= 3) {
@@ -488,7 +506,11 @@ export function buildNudge(
         return null
       }
     } else {
-      lastTableBySession.set(session, { key, repeats: 0 })
+      if (lastTableBySession.size >= LAST_TABLE_MAP_CAP) {
+        const oldest = lastTableBySession.keys().next().value
+        if (oldest !== undefined) lastTableBySession.delete(oldest)
+      }
+      lastTableBySession.set(session.id, { key, repeats: 0 })
     }
   }
 

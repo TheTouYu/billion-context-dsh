@@ -106,7 +106,7 @@ test('PR1: classifySurfaceEvent buckets host policy rows; real content stays rea
   // Audited CONTENT channels (2026-10-28 live audit, session 4b71d96c): these
   // are user-role rows but not policy. They must be foldable (not barriers)
   // and must never win the "last real user" protection window.
-  for (const kind of ['memo-river', 'agent-message', 'time-context', 'skill-rec', 'preset-composer', 'repeat-tool-reminder']) {
+  for (const kind of ['memo-river', 'agent-message', 'time-context', 'skill-rec', 'preset-composer', 'repeat-tool-reminder', 'tool-jobs']) {
     assert.equal(ev({ kind }), 'real', `${kind} is content, not a policy barrier`)
     assert.equal(
       isRealUserTurn({ type: 'user/message', seq: 1, data: { source: { kind } } } as never),
